@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+.codex-slack-sessions.json
+server.log
