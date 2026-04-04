@@ -261,7 +261,7 @@ python3 server.py
 - `/reset`：清掉当前 thread 的 Codex session，下条消息会新建 session
 - `/fresh 你的任务`：忽略当前 thread 旧 session，这条消息强制新建一个 session，并把它设为当前 thread 的新 session
 - `/session`：返回当前 thread 正在使用的 Codex session id
-- `/attach <session_id>`：把当前 Slack thread 绑定到一个已有的 Codex session；默认只允许单用户白名单 attach 未见过的 session，多用户共享 attach 需要显式开启 `ALLOW_SHARED_ATTACH=1`。如果你已经在目标 Codex 会话内部，可以运行 `printenv CODEX_THREAD_ID` 查询当前 session id，或运行 `printenv CODEX_THREAD_ID && pwd` 一并核对工作目录；如果你当前是在普通终端、并不在 Codex 会话里，则没有一个稳定通用的外部 shell 命令能直接查到现成 session id，建议在那个 Codex 会话里直接询问或让它回显
+- `/attach <session_id>`：把当前 Slack thread 绑定到一个已有的 Codex session；默认只允许单用户白名单 attach 未见过的 session，多用户共享 attach 需要显式开启 `ALLOW_SHARED_ATTACH=1`。如果你已经在目标 Codex 会话内部，可以运行 `printenv CODEX_THREAD_ID` 查询当前 session id，或运行 `printenv CODEX_THREAD_ID && pwd` 一并核对工作目录
 - `/where` / `/whoami` / `/status`：返回当前 thread 绑定的 `session_id`、`workdir`、模型等运行状态
 - `/handoff`：基于当前 session 的已有上下文，生成一份适合跨端接力的短版 handoff note，并附带“会话内核验命令”
 - `/recap`：基于当前 session 的已有上下文，生成一份简短的最近进展总结
