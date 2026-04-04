@@ -481,7 +481,8 @@ def build_recap_prompt():
 def append_handoff_footer(text, session_id, workdir):
     base = (text or "").strip()
     footer = (
-        "\n\nTerminal Verify Command:\n"
+        "\n\nIn-Session Verify Command:\n"
+        "如果你已经在目标 Codex 会话内部，可运行：\n"
         "`printenv CODEX_THREAD_ID && pwd`\n"
         f"Expected Session ID: `{session_id or '-'}`\n"
         f"Expected Workdir: `{workdir}`"

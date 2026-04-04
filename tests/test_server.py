@@ -186,7 +186,8 @@ class SlackAccessTests(unittest.TestCase):
 class FormattingTests(unittest.TestCase):
     def test_handoff_footer_includes_terminal_verification(self):
         text = server.append_handoff_footer("Current Goal:\nkeep context", "019-test", "/tmp/workdir")
-        self.assertIn("Terminal Verify Command:", text)
+        self.assertIn("In-Session Verify Command:", text)
+        self.assertIn("如果你已经在目标 Codex 会话内部，可运行：", text)
         self.assertIn("`printenv CODEX_THREAD_ID && pwd`", text)
         self.assertIn("Expected Session ID: `019-test`", text)
         self.assertIn("Expected Workdir: `/tmp/workdir`", text)
