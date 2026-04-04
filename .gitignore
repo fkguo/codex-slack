@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 *.swp
 .codex-slack-sessions.json
+.codex-slack.pid
 .codex-slack.log
 .serena/
 server.log

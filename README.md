@@ -14,9 +14,11 @@
 - 使用 Slack 线程回消息
 - 新的 Slack thread 会创建新的 Codex session
 - 同一个 Slack thread 会继续复用同一个 Codex session
+- 在多人白名单模式下，thread 和 attached session 都会记录 owner，避免跨用户接管
+- 如果同一个 Codex session 被多个 Slack thread 绑定，服务会按 session 串行执行，避免并发 `resume`
 - 支持把 Codex 长输出分片发送
 - 优先只发送 Codex 的最终答复，尽量不把中间进度和思考日志发到 Slack
-- 支持 `/reset`、`reset`、`/fresh`、`fresh`、`/session`、`session`、`/attach`、`attach`、`/where`、`where`、`/whoami`、`whoami`、`/status`、`status`、`/handoff`、`handoff`、`/recap`、`recap` 控制当前 Slack thread 的 Codex session
+- 支持 `/reset`、`reset`、`reset session`、`/reset-session`、`/fresh`、`fresh`、`/session`、`session`、`/attach`、`attach`、`/where`、`where`、`/whoami`、`whoami`、`/status`、`status`、`/handoff`、`handoff`、`/recap`、`recap` 控制当前 Slack thread 的 Codex session
 
 ## 启动
 
@@ -41,6 +43,7 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 SLACK_SIGNING_SECRET=你的_slack_signing_secret
 ALLOWED_SLACK_USER_IDS=U0123456789,U0987654321
+ALLOW_SHARED_ATTACH=0
 
 CODEX_BIN=codex
 CODEX_WORKDIR=/ssd/home/pz
@@ -55,6 +58,10 @@ CODEX_SLACK_SESSION_STORE=/path/to/codex-slack/.codex-slack-sessions.json
 
 - `ALLOWED_SLACK_USER_IDS` 留空表示不限制；如果填写，则只有这些 Slack `user_id` 可以使用 bot
 - 多个 Slack `user_id` 用英文逗号分隔
+- 系统环境变量的优先级高于 `.env` 里的同名变量；如果两边都设置了同一个 key，会优先使用进程环境变量
+- `ALLOW_SHARED_ATTACH=0` 是更安全的默认值；只有在“单用户白名单”模式下，才允许把一个尚未被 bot 见过的终端 session 直接 `attach` 进来
+- 如果你明确需要多用户共享 `attach`，再显式设置 `ALLOW_SHARED_ATTACH=1`
+- 即使开启 `ALLOW_SHARED_ATTACH=1`，一旦某个 Slack thread 或 Codex session 已经绑定给某个 Slack 用户，其他白名单用户也不能继续或接管它
 - GPU/驱动相关命令不要依赖 `--full-auto`
 - 当前 `codex` 在 `--full-auto` 下可能实际退回 `workspace-write` sandbox
 - 需要访问 `nvidia-smi` 这类宿主机资源时，优先显式设置 `CODEX_SANDBOX=danger-full-access`
@@ -70,6 +77,11 @@ codex exec --skip-git-repo-check "reply with exactly OK"
 ```bash
 python3 server.py
 ```
+
+- 只保留一个 `server.py` 进程运行；如果同时启动多个实例，它们会竞争处理 Slack 事件并覆盖同一份 session 映射文件
+- 新版本启动时会持有 `.codex-slack.pid` 进程锁；如果已经有一个实例在跑，第二个实例会直接报错退出
+- 如果你需要自定义 PID 锁文件位置，可以设置 `CODEX_SLACK_INSTANCE_LOCK`
+- 这个 PID 锁依赖 POSIX `fcntl`，在 macOS / Linux 上有效
 
 ## Slack 配置
 
@@ -235,9 +247,11 @@ python3 server.py
 - 之后这个 thread 里的后续回复，会继续 `resume` 这个 thread 自己的 Codex session
 - 不同 thread 之间不会共享上下文、不会共享 session id、不会互相污染历史
 - 私聊场景里，每一条独立私聊消息如果没有复用同一个 `thread_ts`，也会被当成不同 thread；如果是在同一个私聊 thread 下继续回复，则会复用同一个 session
-- 服务会把 `thread_key -> session_id` 记录到本地的 `.codex-slack-sessions.json`
+- 服务会把 `thread_key -> {session_id, owner_user_id}` 记录到本地的 `.codex-slack-sessions.json`
 - 这个文件是本地缓存，所以 `server.py` 重启后，已有 thread 仍然可以继续找到对应的 session id
 - 同一个 thread 内部会串行处理消息，避免并发 `resume` 导致上下文顺序错乱
+- 如果同一个 Codex session 被绑定到多个 Slack thread，服务也会按 `session_id` 串行执行，避免不同 thread 并发 `resume` 同一个 session
+- 在多用户白名单模式下，一旦某个 thread 或 session 已经归属于某个 Slack 用户，其他白名单用户不能继续使用它
 - 如果某个 thread 的旧 session 恢复失败，服务会只丢弃这个 thread 的 session，并自动为这个 thread 重建新会话
 
 当前 thread 级命令的作用域也是“只影响当前 Slack thread”。
@@ -245,7 +259,7 @@ python3 server.py
 - `/reset`：清掉当前 thread 的 Codex session，下条消息会新建 session
 - `/fresh 你的任务`：忽略当前 thread 旧 session，这条消息强制新建一个 session，并把它设为当前 thread 的新 session
 - `/session`：返回当前 thread 正在使用的 Codex session id
-- `/attach <session_id>`：把当前 Slack thread 绑定到一个已有的 Codex session
+- `/attach <session_id>`：把当前 Slack thread 绑定到一个已有的 Codex session；默认只允许单用户白名单 attach 未见过的 session，多用户共享 attach 需要显式开启 `ALLOW_SHARED_ATTACH=1`
 - `/where` / `/whoami` / `/status`：返回当前 thread 绑定的 `session_id`、`workdir`、模型等运行状态
 - `/handoff`：基于当前 session 的已有上下文，生成一份适合跨端接力的短版 handoff note，并附带终端核验命令
 - `/recap`：基于当前 session 的已有上下文，生成一份简短的最近进展总结
@@ -262,7 +276,8 @@ python3 server.py
 - 私聊 bot 时，直接发送普通文本，不要在私聊里再写 `@bot`
 - 例如直接发 `session`
 - 如果你想快速确认当前 thread 到底绑定了哪个会话、跑在哪个目录，直接发 `where`
-- 如果你想接管一个终端里已有的 Codex 会话，先拿到它的 `session id`，再在 Slack 里发 `attach <session_id>`
+- 如果你想接管一个终端里已有的 Codex 会话，先拿到它的 UUID 形式 `session id`，再在 Slack 里发 `attach <session_id>`
+- 默认更安全的策略是：只有单用户白名单模式才允许直接 attach 一个“尚未被 bot 见过”的终端 session；多用户共享 attach 需要显式打开 `ALLOW_SHARED_ATTACH=1`
 - 如果你准备把控制权从终端切到手机，或者从手机切回终端，先发 `handoff` 生成一份短版交接说明会更稳
 - 如果你只是想在手机上快速回顾当前进展，不需要完整交接说明，直接发 `recap`
 - 例如直接发 `fresh 到你的目标项目目录里总结一下当前状态`
@@ -282,5 +297,5 @@ python3 server.py
 - 失败重试和更清晰的状态消息
 - 多轮上下文存储
 - 指定群聊白名单 / 用户白名单
-- 命令路由，例如 `/reset`、`/model`
+- 额外命令路由，例如 `/model`
 - 代码块格式化输出
