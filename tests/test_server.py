@@ -355,6 +355,7 @@ class ProcessPromptTests(unittest.TestCase):
 
     def test_watch_command_starts_dialogue_watch(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
 
         with patch.object(
             server,
@@ -415,6 +416,23 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertIn("已切到 `observe` 模式", text)
         self.assertIn("`watch` 仍在运行", text)
         self.assertIn("`unwatch` 或 `stop watch`", text)
+
+    def test_control_mode_stops_existing_watch(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        with patch.object(server, "stop_watcher", return_value=True) as stop_watcher:
+            server.process_prompt(self.client, self.channel, self.thread_ts, "control", self.user_id)
+        stop_watcher.assert_called_once_with(self.thread_key)
+        text = self.client.messages[0]["text"]
+        self.assertIn("已切到 `control` 模式", text)
+        self.assertIn("已自动停止当前 Slack thread 的 `watch`", text)
+
+    def test_watch_is_blocked_in_control_mode(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        server.process_prompt(self.client, self.channel, self.thread_ts, "watch", self.user_id)
+        text = self.client.messages[0]["text"]
+        self.assertIn("已处于 `control` 模式", text)
+        self.assertIn("为避免重复消息", text)
 
     def test_watch_loop_incremental_push_uses_plain_dialogue_without_update_heading(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)

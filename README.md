@@ -151,7 +151,7 @@ python3 server.py
 - `where` / `whoami` / `status`：查看当前 thread 的绑定状态
 - `watch`：显示最近一轮对话，并持续推送后续新增对话
 - `unwatch` / `stop watch`：停止持续 watch
-- `control` / `takeover`：切到 `control` 模式，允许 Slack 普通消息继续 `resume`
+- `control` / `takeover`：切到 `control` 模式，允许 Slack 普通消息继续 `resume`；如果当前 thread 上有 `watch`，会自动停止以避免重复消息
 - `observe` / `release`：切回 `observe` 模式
 - `handoff`：基于当前 session 生成一份简短交接说明
 - `recap`：基于当前 session 生成一份简短进展总结
@@ -184,13 +184,14 @@ watch
 - `attach` 只负责把“当前 Slack thread”绑定到那个明确的 session
 - 绑定后默认是 `observe` 模式，适合“终端主控，手机旁路观察”
 - `watch` 只显示 thread 对话里的用户消息和 agent `final_answer`
+- 当前 Slack thread 处于 `control` 模式时，不再启动 `watch`；因为后续回复本来就会直接发到这个 thread，继续镜像只会造成重复消息
 - `watch` 首次会回放最近一轮已完成的可显示对话；如果当前最新 turn 还没出 `final_answer`，会等后续增量推送
 - 后续只推送新出现的用户消息和 agent `final_answer`
 - 为了和普通说明消息区分，镜像对话会用 `*User*` / `*Codex*` 标题加引用块样式发送到 Slack
 - 如果 `server.py` 重启了，session 绑定仍然保留，但正在运行的 `watch` 不会自动恢复；需要你在同一个 Slack thread 里重新发一次 `watch`
 - 如果 `watch` 因为读取失败或对话锚点失效而停止，直接重新发送一次 `watch` 即可重建镜像
 - 如果你不想再持续推送，发 `unwatch` 或 `stop watch`
-- 如果你想改为由 Slack 接管，再发 `control` 或 `takeover`
+- 如果你想改为由 Slack 接管，再发 `control` 或 `takeover`；这时当前 thread 上已有的 `watch` 会自动停止
 
 ## 白名单和 User ID
 

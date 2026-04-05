@@ -1285,6 +1285,17 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法查看 thread 对话。",
                         )
                         return
+                    if current_session_mode == SESSION_MODE_CONTROL:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=(
+                                f"<@{user_id}> 当前 Slack thread 已处于 `control` 模式，后续 Codex 回复会直接发到这个 Slack thread。"
+                                " 为避免重复消息，当前不再启动 `watch`。"
+                                " 如果你想改成只读镜像，请先发送 `observe`，再发送 `watch`。"
+                            ),
+                        )
+                        return
 
                     try:
                         watch_text, last_event_key = build_watch_bootstrap(current_session_id)
@@ -1331,13 +1342,18 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                             text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法切到 control 模式。",
                         )
                         return
+                    watch_was_stopped = stop_watcher(thread_key)
                     SESSION_STORE.set_mode(thread_key, SESSION_MODE_CONTROL)
+                    watch_note = ""
+                    if watch_was_stopped:
+                        watch_note = "\n\n已自动停止当前 Slack thread 的 `watch`，避免你在 Slack 主控时收到重复镜像消息。"
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
                         text=(
                             f"<@{user_id}> 当前 Slack thread 已切到 `control` 模式，后续普通消息会继续 session `{current_session_id}`。\n\n"
                             "如果终端里的交互式 Codex 还在活跃，请不要并发操作同一个 session。"
+                            f"{watch_note}"
                         ),
                     )
                     return
