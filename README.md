@@ -33,6 +33,8 @@ cp .env.example .env
 pip install -r requirements.txt
 ```
 
+需要使用 Python `3.12+`，因为 `codex-app-server-sdk>=0.3` 官方包当前从 Python 3.12 开始提供。
+
 当前依赖里包含：
 
 - `slack-bolt`
