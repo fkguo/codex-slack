@@ -227,6 +227,23 @@ def set_thread_name(config: CodexAppServerConfig, session_id, name):
     raise RuntimeError(f"更新 thread 名称失败: {last_error}")
 
 
+def normalize_thread_title(title):
+    normalized = str(title or "").strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def rename_thread(config: CodexAppServerConfig, session_id, title):
+    normalized_title = normalize_thread_title(title)
+    if not session_id:
+        raise RuntimeError("当前还没有可重命名的 session。")
+    if not normalized_title:
+        raise RuntimeError("`name` 后面需要一个非空标题，例如 `name fix flaky test`。")
+    set_thread_name(config, session_id, normalized_title)
+    return normalized_title
+
+
 async def interrupt_turn_async(config: CodexAppServerConfig, turn_id):
     client = create_app_server_client(config)
     await client.start()

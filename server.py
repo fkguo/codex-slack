@@ -15,10 +15,10 @@ from pathlib import Path
 from typing import Optional
 
 import codex_threads as thread_views
-from session_catalog import SessionSelectionCache
+import session_catalog
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
-from turn_control import ActiveTurnRegistry
+from turn_control import ActiveTurnRegistry, interrupt_active_turn, steer_active_turn
 
 warnings.filterwarnings(
     "ignore",
@@ -62,7 +62,7 @@ SESSION_LOCKS_GUARD = threading.Lock()
 WATCHERS = {}
 WATCHERS_GUARD = threading.Lock()
 INSTANCE_LOCK_HANDLE = None
-SESSION_SELECTION_CACHE = SessionSelectionCache()
+SESSION_SELECTION_CACHE = session_catalog.SessionSelectionCache()
 ACTIVE_TURN_REGISTRY = ActiveTurnRegistry()
 SESSION_MODE_OBSERVE = "observe"
 SESSION_MODE_CONTROL = "control"
@@ -456,6 +456,19 @@ def is_recap_command(text):
     return normalized in {"/recap", "recap"}
 
 
+def is_recent_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/recent", "recent"}
+
+
+def is_sessions_command(text):
+    return strip_command_payload(text, "sessions") is not None
+
+
+def strip_sessions_command(text):
+    return strip_command_payload(text, "sessions") or ""
+
+
 def is_watch_command(text):
     return strip_command_payload(text, "watch") == ""
 
@@ -478,12 +491,28 @@ def strip_attach_command(text):
     return strip_command_payload(text, "attach") or ""
 
 
+def parse_attach_recent_selector(payload):
+    normalized = (payload or "").strip()
+    match = re.match(r"^recent\s+(\d+)$", normalized, re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def is_effort_command(text):
     return strip_command_payload(text, "effort") is not None
 
 
 def strip_effort_command(text):
     return strip_command_payload(text, "effort") or ""
+
+
+def is_name_command(text):
+    return strip_command_payload(text, "name") is not None
+
+
+def strip_name_command(text):
+    return strip_command_payload(text, "name") or ""
 
 
 def is_control_command(text):
@@ -494,6 +523,19 @@ def is_control_command(text):
 def is_observe_command(text):
     normalized = (text or "").strip().lower()
     return normalized in {"/observe", "observe", "/release", "release"}
+
+
+def is_interrupt_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/interrupt", "interrupt", "interrupt turn", "/interrupt-turn", "stop turn", "/stop-turn"}
+
+
+def is_steer_command(text):
+    return strip_command_payload(text, "steer") is not None
+
+
+def strip_steer_command(text):
+    return strip_command_payload(text, "steer") or ""
 
 
 def strip_fresh_command(text):
@@ -973,6 +1015,37 @@ def append_recap_footer(text, session_id):
     base = (text or "").strip()
     footer = f"\n\nCurrent Session ID: `{session_id or '-'}`"
     return (base + footer).strip()
+
+
+def parse_sessions_payload(payload):
+    normalized = (payload or "").strip()
+    if not normalized:
+        return False, None
+    if normalized.lower() == "--all":
+        return True, None
+
+    match = re.match(r"^--cwd\s+(.+)$", normalized, re.IGNORECASE | re.DOTALL)
+    if match:
+        cwd = normalize_session_cwd(match.group(1))
+        if not cwd:
+            raise RuntimeError("`sessions --cwd` 后面需要一个目录路径。")
+        return False, cwd
+
+    raise RuntimeError("`sessions` 只支持空参数、`--all` 或 `--cwd <path>`。")
+
+
+def get_recent_sessions_text(thread_key, current_session_id, *, cwd, include_all, heading):
+    summaries = session_catalog.fetch_recent_thread_summaries(
+        get_codex_app_server_config(),
+        cwd=cwd,
+        include_all=include_all,
+    )
+    session_catalog.cache_thread_summaries(SESSION_SELECTION_CACHE, thread_key, summaries)
+    return session_catalog.format_thread_summaries(
+        summaries,
+        heading=heading,
+        current_session_id=current_session_id,
+    )
 
 
 @dataclass
@@ -1830,6 +1903,174 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     post_chunks(client, channel, thread_ts, result)
                     return
 
+                if is_recent_command(prompt):
+                    effective_workdir = resolve_workdir(
+                        thread_key,
+                        session_id=current_session_id,
+                        session_cwd=current_session_cwd,
+                    )
+                    try:
+                        text = get_recent_sessions_text(
+                            thread_key,
+                            current_session_id,
+                            cwd=effective_workdir,
+                            include_all=False,
+                            heading=f"<@{user_id}> 当前工作目录下最近的 Codex sessions:",
+                        )
+                    except Exception as exc:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 读取 recent sessions 失败。\n\n{exc}",
+                        )
+                        return
+
+                    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+                    return
+
+                if is_sessions_command(prompt):
+                    try:
+                        include_all, explicit_cwd = parse_sessions_payload(strip_sessions_command(prompt))
+                    except RuntimeError as exc:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> {exc}",
+                        )
+                        return
+
+                    effective_workdir = explicit_cwd or resolve_workdir(
+                        thread_key,
+                        session_id=current_session_id,
+                        session_cwd=current_session_cwd,
+                    )
+                    heading = (
+                        f"<@{user_id}> 全局最近的 Codex sessions:"
+                        if include_all
+                        else f"<@{user_id}> 当前范围下最近的 Codex sessions:"
+                    )
+                    try:
+                        text = get_recent_sessions_text(
+                            thread_key,
+                            current_session_id,
+                            cwd=effective_workdir,
+                            include_all=include_all,
+                            heading=heading,
+                        )
+                    except Exception as exc:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 读取 sessions 列表失败。\n\n{exc}",
+                        )
+                        return
+
+                    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
+                    return
+
+                if is_name_command(prompt):
+                    if not current_session_id:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 当前 Slack thread 还没有可重命名的 Codex session。",
+                        )
+                        return
+                    try:
+                        normalized_title = thread_views.rename_thread(
+                            get_codex_app_server_config(),
+                            current_session_id,
+                            strip_name_command(prompt),
+                        )
+                    except Exception as exc:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> {exc}",
+                        )
+                        return
+
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=f"<@{user_id}> 已将当前 session 重命名为 `{normalized_title}`。",
+                    )
+                    return
+
+                if is_interrupt_command(prompt):
+                    if not current_session_id:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法中断 turn。",
+                        )
+                        return
+                    try:
+                        active_turn = interrupt_active_turn(get_codex_app_server_config(), current_session_id)
+                    except Exception as exc:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 中断当前 turn 失败。\n\n{exc}",
+                        )
+                        return
+                    ACTIVE_TURN_REGISTRY.set(thread_key, current_session_id, active_turn.turn_id)
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f"<@{user_id}> 已发送中断请求：session `{current_session_id}` 的活跃 turn `{active_turn.turn_id}`。"
+                            " 请等几秒后再用 `status` 确认状态。"
+                        ),
+                    )
+                    return
+
+                if is_steer_command(prompt):
+                    steer_payload = strip_steer_command(prompt)
+                    if not current_session_id:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 当前 Slack thread 还没有 Codex session，暂时无法 steer。",
+                        )
+                        return
+                    if current_session_mode != SESSION_MODE_CONTROL:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=(
+                                get_observe_mode_error(user_id, current_session_id)
+                                + "\n\n`steer` 只在 `control` 模式下可用。"
+                            ),
+                        )
+                        return
+                    if not steer_payload:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 用法：`steer <你要追加给正在运行 turn 的指令>`。",
+                        )
+                        return
+                    try:
+                        active_turn = steer_active_turn(get_codex_app_server_config(), current_session_id, steer_payload)
+                    except Exception as exc:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> steer 失败。\n\n{exc}",
+                        )
+                        return
+                    ACTIVE_TURN_REGISTRY.set(thread_key, current_session_id, active_turn.turn_id)
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            f"<@{user_id}> 已向 session `{current_session_id}` 的活跃 turn `{active_turn.turn_id}` "
+                            f"追加输入：`{truncate_text(steer_payload, max_length=120)}`"
+                        ),
+                    )
+                    return
+
                 if is_unsupported_watch_command(prompt):
                     client.chat_postMessage(
                         channel=channel,
@@ -2000,14 +2241,24 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                     previous_session_id = None
                     attached_session_cwd = None
                     attach_cwd_note = ""
-                    if not normalized_session_id:
+                    attach_error = None
+                    recent_index = parse_attach_recent_selector(normalized_session_id)
+                    if recent_index is not None:
+                        try:
+                            normalized_session_id = session_catalog.resolve_recent_selector(
+                                SESSION_SELECTION_CACHE.get(thread_key),
+                                recent_index,
+                            )
+                        except Exception as exc:
+                            attach_error = str(exc)
+                    elif not normalized_session_id:
                         attach_error = "请用 `attach <session_id>` 绑定一个已有的 Codex 会话。"
                     elif not is_valid_attach_session_id(normalized_session_id):
                         attach_error = (
                             "`attach` 目前只接受 Codex session UUID，例如 "
                             "`attach 019d5868-71ba-7101-9143-81867f3db5bf`。"
                         )
-                    else:
+                    if not attach_error:
                         with suppress(Exception):
                             attached_session_cwd = read_thread_cwd(normalized_session_id)
                         previous_session_id, attach_error = SESSION_STORE.attach_session(
@@ -2039,6 +2290,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
                         existing_session_id=previous_session_id,
                         next_session_id=normalized_session_id,
                     )
+                    ACTIVE_TURN_REGISTRY.clear_for_thread(thread_key)
                     stop_watcher(thread_key)
                     client.chat_postMessage(
                         channel=channel,
@@ -2054,6 +2306,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id):
 
                 if is_reset_command(prompt):
                     previous_session_id = SESSION_STORE.get(thread_key)
+                    ACTIVE_TURN_REGISTRY.clear_for_thread(thread_key)
                     stop_watcher(thread_key)
                     SESSION_STORE.delete(thread_key)
                     log_session_event("reset", thread_key, existing_session_id=previous_session_id)
