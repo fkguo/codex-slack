@@ -13,10 +13,14 @@
 - 每个 Slack thread 绑定一个 Codex session
 - 同一个 Slack thread 会继续复用同一个 session
 - `attach <session_id>` 可把当前 Slack thread 绑定到一个已有 session
+- `recent` / `sessions` 可查看最近的 Codex sessions，并支持 `attach recent <n>`
 - `attach` 后默认进入 `observe` 模式，避免和终端里的交互式 Codex 并发写入
 - 只有切到 `control` / `takeover` 模式后，Slack 普通消息才会继续 `resume` 当前 session
 - `watch` 会先回放最近一轮已完成的可显示对话，然后持续推送后续新增的用户消息和 `final_answer`
+- `name <title>` 可重命名当前 session
+- `interrupt` / `steer <text>` 可控制当前活跃 turn
 - 支持按 Slack thread 设置 reasoning effort：`effort <level>`、`effort reset`、`fresh --effort <level> ...`
+- App Home 会显示默认配置、你自己的 Slack thread 绑定和最近 sessions
 - 支持白名单 `ALLOWED_SLACK_USER_IDS`
 - 同一个 session 会按 `session_id` 串行执行，避免多个 Slack thread 并发 `resume`
 
@@ -135,6 +139,7 @@ python3 server.py
 
 - `app_mention`
 - `message.im`
+- `app_home_opened`
 
 5. 安装或重装到 workspace
 
@@ -150,7 +155,14 @@ python3 server.py
 
 7. 确认私聊入口
 
+- `App Home` 里启用 `Home Tab`
 - `App Home` 里启用 `Messages Tab`
+
+8. 开启交互回调
+
+- 打开 `Interactivity & Shortcuts`
+- 打开 `Interactivity`
+- 因为这里走 Socket Mode，不需要公网 Request URL
 
 ## 常用命令
 
@@ -161,6 +173,12 @@ python3 server.py
 - `fresh --effort <level> <prompt>`：先把当前 Slack thread 的 effort override 设为 `<level>`，再强制新建会话
 - `session` / `/session`：查看当前 Slack thread 绑定的 session id
 - `attach <session_id>` / `/attach <session_id>`：把当前 Slack thread 绑定到已有 session，默认进入 `observe`
+- `recent` / `/recent`：按当前生效工作目录列出最近的 Codex sessions
+- `sessions` / `/sessions`：列出当前范围下最近的 Codex sessions
+- `sessions --all`：列出全局最近的 Codex sessions
+- `sessions --cwd <path>`：列出指定工作目录下最近的 Codex sessions
+- `attach recent <n>`：把当前 Slack thread 绑定到最近一次 `recent` 或 `sessions` 列表里的第 `n` 个 session
+- `name <title>`：重命名当前 Slack thread 绑定的 session
 - `effort`：查看当前 Slack thread 的 reasoning effort 状态
 - `effort <low|medium|high|xhigh>`：设置当前 Slack thread 后续由 Slack 发起 turns 的 effort
 - `effort reset`：清除当前 Slack thread 的 effort override
@@ -169,6 +187,8 @@ python3 server.py
 - `unwatch` / `stop watch`：停止持续 watch
 - `control` / `takeover`：切到 `control` 模式，允许 Slack 普通消息继续 `resume`；如果当前 thread 上有 `watch`，会自动停止以避免重复消息
 - `observe` / `release`：切回 `observe` 模式
+- `interrupt`：向当前 session 的活跃 turn 发送中断请求
+- `steer <text>`：向当前 session 的活跃 turn 追加一条指令；只在 `control` 模式下可用
 - `handoff`：基于当前 session 生成一份简短交接说明
 - `recap`：基于当前 session 生成一份简短进展总结
 
@@ -216,6 +236,7 @@ watch
 行为说明：
 
 - `attach` 只负责把“当前 Slack thread”绑定到那个明确的 session
+- 如果你刚发过 `recent` 或 `sessions`，也可以直接用 `attach recent <n>`
 - 绑定后默认是 `observe` 模式，适合“终端主控，手机旁路观察”
 - 如果服务识别到了该 session 的工作目录，那么之后 Slack `control` / `takeover` 时会继续沿用这个目录
 - `watch` 只显示 thread 对话里的用户消息和 agent `final_answer`
@@ -228,6 +249,24 @@ watch
 - 如果 `watch` 因为读取失败或对话锚点失效而停止，直接重新发送一次 `watch` 即可重建镜像
 - 如果你不想再持续推送，发 `unwatch` 或 `stop watch`
 - 如果你想改为由 Slack 接管，再发 `control` 或 `takeover`；这时当前 thread 上已有的 `watch` 会自动停止
+
+## `recent`、`sessions` 和 App Home
+
+- `recent` 默认只看“当前生效工作目录”下最近的 Codex sessions
+- `sessions` 默认和 `recent` 类似，但支持显式范围控制
+- `sessions --all` 会忽略工作目录过滤，显示全局最近 sessions
+- `sessions --cwd /path/to/project` 会按你给定的目录过滤
+- 列表里的序号只在当前 Slack thread 内暂存一段时间，所以如果你想用 `attach recent <n>`，最好紧接着在同一个 Slack thread 里发送
+- App Home 是一个只读仪表板，方便你快速看到默认 model / effort / workdir、你自己的 Slack thread 绑定，以及最近 sessions
+- App Home 不会替代 Slack thread 控制；真正的 `attach`、`watch`、`takeover`、`steer` 仍然在消息 thread 里完成
+
+## `interrupt` 和 `steer`
+
+- `interrupt` 会读取当前 session 的官方 thread 状态，找到活跃 turn 并发送中断请求
+- `interrupt` 在 `observe` 和 `control` 模式下都可以使用
+- `steer <text>` 会向当前活跃 turn 追加一条指令
+- `steer` 只在 `control` 模式下可用，避免你在只读镜像模式里意外写入
+- 这两个命令都依赖当前 session 里确实存在活跃 turn；如果当前没有正在运行的 turn，Slack 会直接返回错误说明
 
 ## 白名单和 User ID
 
@@ -257,13 +296,20 @@ watch
 运行语法检查和测试：
 
 ```bash
-python3 -m py_compile server.py tests/test_server.py
-python3 -m unittest tests.test_server -q
+python3 -m py_compile server.py codex_threads.py session_catalog.py turn_control.py slack_home.py tests/test_server.py tests/test_session_catalog.py tests/test_turn_control.py tests/test_slack_home.py
+python3 -m unittest -q tests.test_server tests.test_session_catalog tests.test_turn_control tests.test_slack_home
 ```
 
 ## 文件说明
 
 - `server.py`：Slack Socket Mode 服务和 Codex session 管理
-- `tests/test_server.py`：当前核心测试
+- `codex_threads.py`：官方 app-server thread 读写封装
+- `session_catalog.py`：recent / sessions 列表和 `attach recent <n>` 选择缓存
+- `turn_control.py`：活跃 turn 检测、`interrupt` 和 `steer`
+- `slack_home.py`：App Home 仪表板视图
+- `tests/test_server.py`：主流程和命令路由测试
+- `tests/test_session_catalog.py`：recent / sessions 列表测试
+- `tests/test_turn_control.py`：turn 控制测试
+- `tests/test_slack_home.py`：App Home 视图测试
 - `.env.example`：环境变量模板
 - `requirements.txt`：Python 依赖

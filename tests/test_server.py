@@ -57,10 +57,16 @@ class CommandParsingTests(unittest.TestCase):
     def test_command_variants(self):
         self.assertTrue(server.is_fresh_command("/fresh summarize status"))
         self.assertEqual(server.strip_fresh_command("fresh do the task"), "do the task")
+        self.assertTrue(server.is_recent_command("recent"))
+        self.assertTrue(server.is_sessions_command("/sessions --all"))
+        self.assertEqual(server.strip_sessions_command("sessions --cwd /tmp/project"), "--cwd /tmp/project")
         self.assertTrue(server.is_attach_command("attach 019-test"))
         self.assertEqual(server.strip_attach_command("/attach 019-test"), "019-test")
+        self.assertEqual(server.parse_attach_recent_selector("recent 2"), 2)
         self.assertTrue(server.is_effort_command("effort high"))
         self.assertEqual(server.strip_effort_command("/effort reset"), "reset")
+        self.assertTrue(server.is_name_command("name flaky tests"))
+        self.assertEqual(server.strip_name_command("/name keep it short"), "keep it short")
         self.assertTrue(server.is_status_command("whoami"))
         self.assertTrue(server.is_session_command("session id"))
         self.assertTrue(server.is_watch_command("/watch"))
@@ -81,6 +87,11 @@ class CommandParsingTests(unittest.TestCase):
         self.assertIsNone(effort)
         self.assertEqual(prompt, "--effort auto fix flaky test")
         self.assertIn("low|medium|high|xhigh", error)
+
+    def test_parse_sessions_payload_supports_all_and_cwd(self):
+        self.assertEqual(server.parse_sessions_payload(""), (False, None))
+        self.assertEqual(server.parse_sessions_payload("--all"), (True, None))
+        self.assertEqual(server.parse_sessions_payload("--cwd /tmp/project"), (False, "/tmp/project"))
 
 
 class SlackAccessTests(unittest.TestCase):
@@ -643,6 +654,13 @@ class ProcessPromptTests(unittest.TestCase):
         self.session_store_patcher = patch.object(server, "SESSION_STORE", self.store)
         self.session_store_patcher.start()
         self.addCleanup(self.session_store_patcher.stop)
+        self.selection_cache = server.session_catalog.SessionSelectionCache()
+        self.selection_cache_patcher = patch.object(server, "SESSION_SELECTION_CACHE", self.selection_cache)
+        self.selection_cache_patcher.start()
+        self.addCleanup(self.selection_cache_patcher.stop)
+        self.turn_registry_patcher = patch.object(server, "ACTIVE_TURN_REGISTRY", server.ActiveTurnRegistry())
+        self.turn_registry_patcher.start()
+        self.addCleanup(self.turn_registry_patcher.stop)
         server.WATCHERS.clear()
         self.addCleanup(server.WATCHERS.clear)
         self.client = DummyClient()
@@ -672,6 +690,40 @@ class ProcessPromptTests(unittest.TestCase):
         server.process_prompt(self.client, self.channel, self.thread_ts, "watch raw", self.user_id)
         self.assertIn("不再接受参数", self.client.messages[0]["text"])
 
+    def test_recent_command_posts_scoped_session_list(self):
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_ATTACHED,
+            session_cwd="/tmp/attached-project",
+        )
+
+        with patch.object(server, "get_recent_sessions_text", return_value="recent list") as get_recent_sessions_text:
+            server.process_prompt(self.client, self.channel, self.thread_ts, "recent", self.user_id)
+
+        get_recent_sessions_text.assert_called_once_with(
+            self.thread_key,
+            self.session_id,
+            cwd="/tmp/attached-project",
+            include_all=False,
+            heading=f"<@{self.user_id}> 当前工作目录下最近的 Codex sessions:",
+        )
+        self.assertEqual(self.client.messages[0]["text"], "recent list")
+
+    def test_sessions_cwd_command_posts_explicit_scope_list(self):
+        with patch.object(server, "get_recent_sessions_text", return_value="cwd list") as get_recent_sessions_text:
+            server.process_prompt(self.client, self.channel, self.thread_ts, "sessions --cwd /tmp/project-x", self.user_id)
+
+        get_recent_sessions_text.assert_called_once_with(
+            self.thread_key,
+            None,
+            cwd="/tmp/project-x",
+            include_all=False,
+            heading=f"<@{self.user_id}> 当前范围下最近的 Codex sessions:",
+        )
+        self.assertEqual(self.client.messages[0]["text"], "cwd list")
+
     def test_attach_command_binds_session_in_observe_mode(self):
         with patch.dict(
             server.ENV,
@@ -693,6 +745,43 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertEqual(self.store.get_session_cwd(self.thread_key), "/tmp/attached-project")
         self.assertIn("默认已进入 `observe` 模式", self.client.messages[0]["text"])
         self.assertIn("`/tmp/attached-project`", self.client.messages[0]["text"])
+
+    def test_attach_recent_binds_cached_session_in_observe_mode(self):
+        selected_session_id = "019d5868-71ba-7101-9143-81867f3db5c0"
+        self.selection_cache.put(self.thread_key, [self.session_id, selected_session_id])
+
+        with patch.dict(
+            server.ENV,
+            {"ALLOWED_SLACK_USER_IDS": self.user_id, "ALLOW_SHARED_ATTACH": "0"},
+            clear=False,
+        ):
+            with patch.object(server, "stop_watcher", return_value=False):
+                with patch.object(server, "read_thread_cwd", return_value="/tmp/selected-project"):
+                    server.process_prompt(
+                        self.client,
+                        self.channel,
+                        self.thread_ts,
+                        "attach recent 2",
+                        self.user_id,
+                    )
+
+        self.assertEqual(self.store.get(self.thread_key), selected_session_id)
+        self.assertEqual(self.store.get_mode(self.thread_key), server.SESSION_MODE_OBSERVE)
+        self.assertEqual(self.store.get_session_cwd(self.thread_key), "/tmp/selected-project")
+        self.assertIn(selected_session_id, self.client.messages[0]["text"])
+
+    def test_name_command_renames_current_session(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+
+        with patch.object(server.thread_views, "rename_thread", return_value="triage flaky test") as rename_thread:
+            server.process_prompt(self.client, self.channel, self.thread_ts, "name triage flaky test", self.user_id)
+
+        rename_thread.assert_called_once_with(
+            server.get_codex_app_server_config(),
+            self.session_id,
+            "triage flaky test",
+        )
+        self.assertIn("已将当前 session 重命名为 `triage flaky test`", self.client.messages[0]["text"])
 
     def test_status_reports_watch_state(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
