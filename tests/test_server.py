@@ -847,6 +847,134 @@ class ProcessPromptTests(unittest.TestCase):
         run_codex_with_updates.assert_not_called()
         self.assertIn("下载 Slack 图片失败", self.client.messages[-1]["text"])
 
+    def test_document_only_message_uses_default_prompt_and_document_manifest(self):
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="done",
+            exit_code=0,
+            raw_output="",
+            final_output="done",
+            json_output="",
+            cleaned_output="done",
+            timed_out=False,
+        )
+        document_download = server.slack_document_inputs.SlackDocumentDownload(
+            file_id="F1",
+            filename="report.pdf",
+            download_url="https://files.slack.com/report.pdf",
+            mimetype="application/pdf",
+        )
+        downloaded_document = server.slack_document_inputs.DownloadedSlackDocument(
+            file_id="F1",
+            filename="report.pdf",
+            path=Path("/tmp/report.pdf"),
+            mimetype="application/pdf",
+        )
+
+        with patch.object(server.slack_image_inputs, "build_image_downloads_from_event", return_value=[]):
+            with patch.object(server.slack_document_inputs, "build_document_downloads_from_event", return_value=[document_download]):
+                with patch.object(server.slack_document_inputs, "download_slack_document_files", return_value=[downloaded_document]):
+                    with patch.object(server.slack_document_inputs, "cleanup_downloaded_documents") as cleanup_downloaded_documents:
+                        with patch.object(server.slack_document_inputs, "cleanup_download_directory") as cleanup_download_directory:
+                            with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+                                server.process_prompt(
+                                    self.client,
+                                    self.channel,
+                                    self.thread_ts,
+                                    "",
+                                    self.user_id,
+                                    slack_event_payload={"event": {"files": [{"id": "F1"}]}},
+                                )
+
+        prompt = run_codex_with_updates.call_args.args[3]
+        self.assertIn(server.DEFAULT_DOCUMENT_ONLY_PROMPT, prompt)
+        self.assertIn("report.pdf", prompt)
+        self.assertIn("/tmp/report.pdf", prompt)
+        cleanup_downloaded_documents.assert_called_once_with([downloaded_document])
+        cleanup_download_directory.assert_called_once()
+
+    def test_prompt_with_document_attachment_appends_document_manifest(self):
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="done",
+            exit_code=0,
+            raw_output="",
+            final_output="done",
+            json_output="",
+            cleaned_output="done",
+            timed_out=False,
+        )
+        document_download = server.slack_document_inputs.SlackDocumentDownload(
+            file_id="F1",
+            filename="notes.md",
+            download_url="https://files.slack.com/notes.md",
+            mimetype="text/markdown",
+        )
+        downloaded_document = server.slack_document_inputs.DownloadedSlackDocument(
+            file_id="F1",
+            filename="notes.md",
+            path=Path("/tmp/notes.md"),
+            mimetype="text/markdown",
+        )
+
+        with patch.object(server.slack_image_inputs, "build_image_downloads_from_event", return_value=[]):
+            with patch.object(server.slack_document_inputs, "build_document_downloads_from_event", return_value=[document_download]):
+                with patch.object(server.slack_document_inputs, "download_slack_document_files", return_value=[downloaded_document]):
+                    with patch.object(server.slack_document_inputs, "cleanup_downloaded_documents"):
+                        with patch.object(server.slack_document_inputs, "cleanup_download_directory"):
+                            with patch.object(server, "run_codex_with_updates", return_value=result) as run_codex_with_updates:
+                                server.process_prompt(
+                                    self.client,
+                                    self.channel,
+                                    self.thread_ts,
+                                    "请总结这份文档",
+                                    self.user_id,
+                                    slack_event_payload={"event": {"files": [{"id": "F1"}]}},
+                                )
+
+        prompt = run_codex_with_updates.call_args.args[3]
+        self.assertTrue(prompt.startswith("请总结这份文档"))
+        self.assertIn("notes.md", prompt)
+        self.assertIn("/tmp/notes.md", prompt)
+
+    def test_document_download_failure_returns_user_facing_error(self):
+        document_download = server.slack_document_inputs.SlackDocumentDownload(
+            file_id="F1",
+            filename="report.pdf",
+            download_url="https://files.slack.com/report.pdf",
+            mimetype="application/pdf",
+        )
+
+        with patch.object(server.slack_image_inputs, "build_image_downloads_from_event", return_value=[]):
+            with patch.object(server.slack_document_inputs, "build_document_downloads_from_event", return_value=[document_download]):
+                with patch.object(server.slack_document_inputs, "download_slack_document_files", side_effect=RuntimeError("boom")):
+                    with patch.object(server, "run_codex_with_updates") as run_codex_with_updates:
+                        server.process_prompt(
+                            self.client,
+                            self.channel,
+                            self.thread_ts,
+                            "",
+                            self.user_id,
+                            slack_event_payload={"event": {"files": [{"id": "F1"}]}},
+                        )
+
+        run_codex_with_updates.assert_not_called()
+        self.assertIn("下载 Slack 文档失败", self.client.messages[-1]["text"])
+
+    def test_unsupported_attachment_without_text_returns_hint(self):
+        with patch.object(server.slack_image_inputs, "build_image_downloads_from_event", return_value=[]):
+            with patch.object(server.slack_document_inputs, "build_document_downloads_from_event", return_value=[]):
+                server.process_prompt(
+                    self.client,
+                    self.channel,
+                    self.thread_ts,
+                    "",
+                    self.user_id,
+                    slack_event_payload={"event": {"files": [{"id": "F1", "name": "archive.zip"}]}},
+                )
+
+        self.assertIn("暂不支持的附件类型", self.client.messages[-1]["text"])
+
     def test_get_home_bindings_rows_prefers_session_title_and_rename_action(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id, session_cwd="/tmp/project")
         with patch.object(server, "read_thread_response", return_value={"thread": {"name": "mobile handoff"}}):

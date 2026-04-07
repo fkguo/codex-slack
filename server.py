@@ -16,6 +16,7 @@ from typing import Optional
 
 import codex_threads as thread_views
 import session_catalog
+import slack_document_inputs
 import slack_home
 import slack_image_inputs
 from slack_bolt import App
@@ -79,6 +80,9 @@ MAX_APP_SERVER_RETRIES = 2
 MAX_WATCH_READ_FAILURES = 2
 DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES = 32 * 1024 * 1024
 DEFAULT_IMAGE_ONLY_PROMPT = "请查看我附上的图片，并按我的上下文继续处理。"
+DEFAULT_DOCUMENT_ONLY_PROMPT = "请先阅读我附上的文档，并按我的上下文继续处理。"
+DEFAULT_IMAGE_AND_DOCUMENT_ONLY_PROMPT = "请查看我附上的图片并阅读我附上的文档，然后按我的上下文继续处理。"
+SUPPORTED_DOCUMENT_ATTACHMENT_HINT = "txt/md/json/yaml/csv/pdf/docx 等文档类附件"
 DEFAULT_PROGRESS_UPDATES_ENABLED = True
 
 
@@ -843,6 +847,35 @@ def build_image_args(image_paths):
             continue
         args.extend(["--image", path])
     return args
+
+
+def build_document_attachment_prompt(prompt, downloaded_documents):
+    normalized_prompt = str(prompt or "").strip()
+    documents = list(downloaded_documents or [])
+    if not documents:
+        return normalized_prompt
+
+    lines = []
+    if normalized_prompt:
+        lines.append(normalized_prompt)
+        lines.append("")
+    lines.append("以下是本次 Slack 消息附带的文档文件，它们已经下载到本地。请先按需读取这些文件的实际内容，再继续处理请求：")
+    for item in documents:
+        mimetype = str(getattr(item, "mimetype", "") or "").strip() or "-"
+        filename = str(getattr(item, "filename", "") or getattr(getattr(item, "path", None), "name", "document")).strip()
+        path = str(getattr(item, "path", "") or "").strip()
+        lines.append(f"- {filename} | {mimetype} | path=`{path}`")
+    return "\n".join(lines).strip()
+
+
+def get_default_attachment_only_prompt(*, has_images=False, has_documents=False):
+    if has_images and has_documents:
+        return DEFAULT_IMAGE_AND_DOCUMENT_ONLY_PROMPT
+    if has_images:
+        return DEFAULT_IMAGE_ONLY_PROMPT
+    if has_documents:
+        return DEFAULT_DOCUMENT_ONLY_PROMPT
+    return ""
 
 
 def get_observe_mode_error(user_id, session_id):
@@ -1726,12 +1759,32 @@ def start_watcher(client, channel, thread_ts, thread_key, session_id, last_event
 def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payload=None):
     thread_key = make_thread_key(channel, thread_ts)
     try:
+        attachment_candidates = (
+            slack_image_inputs.extract_candidate_files(slack_event_payload)
+            if slack_event_payload
+            else []
+        )
         image_download_specs = (
             slack_image_inputs.build_image_downloads_from_event(slack_event_payload)
             if slack_event_payload
             else []
         )
-        if not prompt and not image_download_specs:
+        document_download_specs = (
+            slack_document_inputs.build_document_downloads_from_event(slack_event_payload)
+            if slack_event_payload
+            else []
+        )
+        if not prompt and not image_download_specs and not document_download_specs:
+            if attachment_candidates:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=(
+                        "当前这条消息只包含暂不支持的附件类型。"
+                        f" 目前支持图片附件，以及 {SUPPORTED_DOCUMENT_ATTACHMENT_HINT}。"
+                    ),
+                )
+                return
             client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
@@ -2404,8 +2457,11 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             text=f"<@{user_id}> {fresh_error}",
                         )
                         return
-                if not effective_prompt and image_download_specs:
-                    effective_prompt = DEFAULT_IMAGE_ONLY_PROMPT
+                if not effective_prompt and (image_download_specs or document_download_specs):
+                    effective_prompt = get_default_attachment_only_prompt(
+                        has_images=bool(image_download_specs),
+                        has_documents=bool(document_download_specs),
+                    )
 
                 if not effective_prompt:
                     client.chat_postMessage(
@@ -2464,6 +2520,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                 )
                 image_paths = []
                 image_download_dir = None
+                downloaded_documents = []
+                document_download_dir = None
                 if image_download_specs:
                     image_download_dir = tempfile.mkdtemp(prefix="codex-slack-images-")
                     try:
@@ -2480,6 +2538,26 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             text=f"<@{user_id}> 下载 Slack 图片失败，暂时无法把这条图片消息传给 Codex。\n\n{exc}",
                         )
                         return
+                if document_download_specs:
+                    document_download_dir = tempfile.mkdtemp(prefix="codex-slack-documents-")
+                    try:
+                        downloaded_documents = slack_document_inputs.download_slack_document_files(
+                            document_download_specs,
+                            ENV.get("SLACK_BOT_TOKEN", ""),
+                            download_dir=document_download_dir,
+                        )
+                    except Exception as exc:
+                        slack_document_inputs.cleanup_download_directory(document_download_dir)
+                        slack_image_inputs.cleanup_downloaded_files(image_paths)
+                        slack_image_inputs.cleanup_download_directory(image_download_dir)
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 下载 Slack 文档失败，暂时无法把这条文档消息传给 Codex。\n\n{exc}",
+                        )
+                        return
+
+                effective_prompt = build_document_attachment_prompt(effective_prompt, downloaded_documents)
 
                 try:
                     with session_execution_guard(existing_session_id):
@@ -2540,6 +2618,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                                 flush=True,
                             )
                 finally:
+                    slack_document_inputs.cleanup_downloaded_documents(downloaded_documents)
+                    slack_document_inputs.cleanup_download_directory(document_download_dir)
                     slack_image_inputs.cleanup_downloaded_files(image_paths)
                     slack_image_inputs.cleanup_download_directory(image_download_dir)
 
