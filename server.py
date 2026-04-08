@@ -2181,6 +2181,136 @@ def find_subagent_for_main_session(main_session_id, subagent_thread_id):
     return None
 
 
+def get_pending_subagent_rebuild_notice(thread_key, *, previous_session_id, next_session_id, owner_user_id):
+    if not previous_session_id or not next_session_id or previous_session_id == next_session_id:
+        return None
+    pending_target = SESSION_STORE.get_pending_subagent_target(
+        thread_key,
+        current_session_id=previous_session_id,
+        owner_user_id=owner_user_id,
+    )
+    if not pending_target:
+        return None
+    label = format_subagent_short_name(
+        pending_target.get("agent_nickname"),
+        pending_target.get("agent_role"),
+        pending_target.get("thread_id"),
+    )
+    return (
+        f"<@{owner_user_id}> 由于当前主 session 已切换为 `{next_session_id}`，"
+        f"之前挂起的 subagent 单次路由 `{label}` 已自动失效；当前目标仍是 `main`。"
+    )
+
+
+def handle_subagent_send_next_action(client, logger, *, thread_key, session_id, subagent_thread_id, user_id, channel_id, thread_ts):
+    current_session_id = SESSION_STORE.get(thread_key)
+    current_mode = get_session_mode(thread_key)
+    if current_session_id != session_id:
+        SESSION_STORE.clear_pending_subagent_target(thread_key)
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
+        )
+        return
+    if current_mode != SESSION_MODE_CONTROL:
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=f"<@{user_id}> 当前 Slack thread 处于 `observe` 模式。请先发送 `control` 或 `takeover`，再选择 `Send next message`。",
+        )
+        return
+    try:
+        subagent = find_subagent_for_main_session(session_id, subagent_thread_id)
+    except Exception as exc:
+        subagent = None
+        logger.exception("Failed discovering subagent %s for %s: %r", subagent_thread_id, session_id, exc)
+    if not subagent:
+        SESSION_STORE.clear_pending_subagent_target(thread_key)
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="这个 subagent 已不可用、不可读，或不再属于当前主 session。请重新发送 `subagents`。",
+        )
+        return
+    previous_target = SESSION_STORE.get_pending_subagent_target(
+        thread_key,
+        current_session_id=session_id,
+        owner_user_id=user_id,
+    )
+    SESSION_STORE.set_pending_subagent_target(
+        thread_key,
+        thread_id=subagent_thread_id,
+        agent_nickname=subagent.get("agent_nickname"),
+        agent_role=subagent.get("agent_role"),
+        owner_user_id=user_id,
+        session_id=session_id,
+    )
+    label = format_subagent_short_name(
+        subagent.get("agent_nickname"),
+        subagent.get("agent_role"),
+        subagent_thread_id,
+    )
+    if previous_target and previous_target.get("thread_id") != subagent_thread_id:
+        text = f"下一条普通消息目标已更新为 `{label}`。发送后会自动恢复 `main`。"
+    else:
+        text = f"下一条普通消息将发给 `{label}`，发送后会自动恢复 `main`。"
+    client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=thread_ts,
+        text=text,
+        blocks=build_subagent_send_cancel_blocks(thread_key, session_id),
+    )
+
+
+def handle_subagent_send_cancel_action(client, *, thread_key, channel_id, thread_ts):
+    SESSION_STORE.clear_pending_subagent_target(thread_key)
+    client.chat_postMessage(
+        channel=channel_id,
+        thread_ts=thread_ts,
+        text="已取消这次 subagent 单次路由；当前目标仍是 `main`。",
+    )
+
+
+def handle_subagent_observe_action(client, *, thread_key, session_id, subagent_thread_id, user_id, channel_id, thread_ts):
+    if SESSION_STORE.get(thread_key) != session_id:
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
+        )
+        return
+    attach_thread_to_session(
+        client,
+        channel_id,
+        thread_ts,
+        thread_key,
+        session_id=subagent_thread_id,
+        user_id=user_id,
+        mode=SESSION_MODE_OBSERVE,
+        include_bootstrap=True,
+    )
+
+
+def handle_subagent_attach_action(client, *, thread_key, session_id, subagent_thread_id, user_id, channel_id, thread_ts):
+    if SESSION_STORE.get(thread_key) != session_id:
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
+        )
+        return
+    attach_thread_to_session(
+        client,
+        channel_id,
+        thread_ts,
+        thread_key,
+        session_id=subagent_thread_id,
+        user_id=user_id,
+        mode=SESSION_MODE_OBSERVE,
+    )
+
+
 def build_subagents_message(thread_key, session_id, subagents, *, session_mode):
     intro_lines = [
         "*Subagents*",
@@ -2210,6 +2340,44 @@ def build_subagents_message(thread_key, session_id, subagents, *, session_mode):
             item.get("thread_id"),
         )
         updated_at = format_relative_timestamp(item.get("updated_at"))
+        action_elements = []
+        if session_mode != SESSION_MODE_OBSERVE:
+            action_elements.append(
+                {
+                    "type": "button",
+                    "action_id": SUBAGENT_SEND_NEXT_ACTION,
+                    "text": {"type": "plain_text", "text": "Send next message"},
+                    "value": encode_subagent_action_value(
+                        thread_key,
+                        session_id,
+                        item.get("thread_id"),
+                    ),
+                }
+            )
+        action_elements.extend(
+            [
+                {
+                    "type": "button",
+                    "action_id": SUBAGENT_OBSERVE_ACTION,
+                    "text": {"type": "plain_text", "text": "Observe"},
+                    "value": encode_subagent_action_value(
+                        thread_key,
+                        session_id,
+                        item.get("thread_id"),
+                    ),
+                },
+                {
+                    "type": "button",
+                    "action_id": SUBAGENT_ATTACH_ACTION,
+                    "text": {"type": "plain_text", "text": "Attach"},
+                    "value": encode_subagent_action_value(
+                        thread_key,
+                        session_id,
+                        item.get("thread_id"),
+                    ),
+                },
+            ]
+        )
         blocks.extend(
             [
                 {
@@ -2226,38 +2394,7 @@ def build_subagents_message(thread_key, session_id, subagents, *, session_mode):
                 },
                 {
                     "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "action_id": SUBAGENT_SEND_NEXT_ACTION,
-                            "text": {"type": "plain_text", "text": "Send next message"},
-                            "value": encode_subagent_action_value(
-                                thread_key,
-                                session_id,
-                                item.get("thread_id"),
-                            ),
-                        },
-                        {
-                            "type": "button",
-                            "action_id": SUBAGENT_OBSERVE_ACTION,
-                            "text": {"type": "plain_text", "text": "Observe"},
-                            "value": encode_subagent_action_value(
-                                thread_key,
-                                session_id,
-                                item.get("thread_id"),
-                            ),
-                        },
-                        {
-                            "type": "button",
-                            "action_id": SUBAGENT_ATTACH_ACTION,
-                            "text": {"type": "plain_text", "text": "Attach"},
-                            "value": encode_subagent_action_value(
-                                thread_key,
-                                session_id,
-                                item.get("thread_id"),
-                            ),
-                        },
-                    ],
+                    "elements": action_elements,
                 },
             ]
         )
@@ -4478,6 +4615,12 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         f" result_length={len(result or '')}",
                         flush=True,
                     )
+                    pending_target_rebuild_notice = get_pending_subagent_rebuild_notice(
+                        thread_key,
+                        previous_session_id=current_session_id,
+                        next_session_id=next_session_id,
+                        owner_user_id=user_id,
+                    )
                     if should_update_session_activity(codex_result) and next_session_id != current_session_id:
                         SESSION_STORE.set(
                             thread_key,
@@ -4495,6 +4638,12 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         next_session_id=next_session_id,
                     )
                     post_chunks(client, channel, thread_ts, maybe_prefix_thread_output(next_session_id or current_session_id, result))
+                    if pending_target_rebuild_notice:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=pending_target_rebuild_notice,
+                        )
                     if response_contains_proposed_plan(result):
                         persist_latest_proposed_plan(
                             thread_key,
@@ -4574,6 +4723,12 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         f" result_length={len(result or '')}",
                         flush=True,
                     )
+                    pending_target_rebuild_notice = get_pending_subagent_rebuild_notice(
+                        thread_key,
+                        previous_session_id=current_session_id,
+                        next_session_id=next_session_id,
+                        owner_user_id=user_id,
+                    )
                     if should_update_session_activity(codex_result) and next_session_id != current_session_id:
                         SESSION_STORE.set(
                             thread_key,
@@ -4591,6 +4746,12 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         next_session_id=next_session_id,
                     )
                     post_chunks(client, channel, thread_ts, maybe_prefix_thread_output(next_session_id or current_session_id, result))
+                    if pending_target_rebuild_notice:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=pending_target_rebuild_notice,
+                        )
                     if response_contains_proposed_plan(result):
                         persist_latest_proposed_plan(
                             thread_key,
@@ -5781,63 +5942,15 @@ def build_app():
         channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
         if not channel_id or not thread_ts:
             return
-        current_session_id = SESSION_STORE.get(thread_key)
-        current_mode = get_session_mode(thread_key)
-        if current_session_id != session_id:
-            SESSION_STORE.clear_pending_subagent_target(thread_key)
-            client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
-            )
-            return
-        if current_mode != SESSION_MODE_CONTROL:
-            client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text=f"<@{user_id}> 当前 Slack thread 处于 `observe` 模式。请先发送 `control` 或 `takeover`，再选择 `Send next message`。",
-            )
-            return
-        try:
-            subagent = find_subagent_for_main_session(session_id, subagent_thread_id)
-        except Exception as exc:
-            subagent = None
-            logger.exception("Failed discovering subagent %s for %s: %r", subagent_thread_id, session_id, exc)
-        if not subagent:
-            SESSION_STORE.clear_pending_subagent_target(thread_key)
-            client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text="这个 subagent 已不可用、不可读，或不再属于当前主 session。请重新发送 `subagents`。",
-            )
-            return
-        previous_target = SESSION_STORE.get_pending_subagent_target(
-            thread_key,
-            current_session_id=session_id,
-            owner_user_id=user_id,
-        )
-        pending_target = SESSION_STORE.set_pending_subagent_target(
-            thread_key,
-            thread_id=subagent_thread_id,
-            agent_nickname=subagent.get("agent_nickname"),
-            agent_role=subagent.get("agent_role"),
-            owner_user_id=user_id,
+        handle_subagent_send_next_action(
+            client,
+            logger,
+            thread_key=thread_key,
             session_id=session_id,
-        )
-        label = format_subagent_short_name(
-            subagent.get("agent_nickname"),
-            subagent.get("agent_role"),
-            subagent_thread_id,
-        )
-        if previous_target and previous_target.get("thread_id") != subagent_thread_id:
-            text = f"下一条普通消息目标已更新为 `{label}`。发送后会自动恢复 `main`。"
-        else:
-            text = f"下一条普通消息将发给 `{label}`，发送后会自动恢复 `main`。"
-        client.chat_postMessage(
-            channel=channel_id,
+            subagent_thread_id=subagent_thread_id,
+            user_id=user_id,
+            channel_id=channel_id,
             thread_ts=thread_ts,
-            text=text,
-            blocks=build_subagent_send_cancel_blocks(thread_key, session_id),
         )
 
     @app.action(SUBAGENT_SEND_CANCEL_ACTION)
@@ -5863,11 +5976,11 @@ def build_app():
         channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
         if not channel_id or not thread_ts:
             return
-        SESSION_STORE.clear_pending_subagent_target(thread_key)
-        client.chat_postMessage(
-            channel=channel_id,
+        handle_subagent_send_cancel_action(
+            client,
+            thread_key=thread_key,
+            channel_id=channel_id,
             thread_ts=thread_ts,
-            text="已取消这次 subagent 单次路由；当前目标仍是 `main`。",
         )
 
     @app.action(SUBAGENT_OBSERVE_ACTION)
@@ -5893,22 +6006,14 @@ def build_app():
         channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
         if not channel_id or not thread_ts:
             return
-        if SESSION_STORE.get(thread_key) != session_id:
-            client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
-            )
-            return
-        attach_thread_to_session(
+        handle_subagent_observe_action(
             client,
-            channel_id,
-            thread_ts,
-            thread_key,
-            session_id=subagent_thread_id,
+            thread_key=thread_key,
+            session_id=session_id,
+            subagent_thread_id=subagent_thread_id,
             user_id=user_id,
-            mode=SESSION_MODE_OBSERVE,
-            include_bootstrap=True,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
         )
 
     @app.action(SUBAGENT_ATTACH_ACTION)
@@ -5934,21 +6039,14 @@ def build_app():
         channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
         if not channel_id or not thread_ts:
             return
-        if SESSION_STORE.get(thread_key) != session_id:
-            client.chat_postMessage(
-                channel=channel_id,
-                thread_ts=thread_ts,
-                text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
-            )
-            return
-        attach_thread_to_session(
+        handle_subagent_attach_action(
             client,
-            channel_id,
-            thread_ts,
-            thread_key,
-            session_id=subagent_thread_id,
+            thread_key=thread_key,
+            session_id=session_id,
+            subagent_thread_id=subagent_thread_id,
             user_id=user_id,
-            mode=SESSION_MODE_OBSERVE,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
         )
 
     @app.action(THREAD_COLLABORATION_MODE_PLAN_ACTION)

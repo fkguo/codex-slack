@@ -1754,6 +1754,15 @@ class ProcessPromptTests(unittest.TestCase):
 
         self.assertEqual(self.client.messages[0]["blocks"][0]["text"]["text"].splitlines()[0], "*Subagents*")
         self.assertIn("observe", self.client.messages[0]["blocks"][0]["text"]["text"])
+        action_ids = [
+            element["action_id"]
+            for block in self.client.messages[0]["blocks"]
+            if block.get("type") == "actions"
+            for element in block.get("elements", [])
+        ]
+        self.assertNotIn(server.SUBAGENT_SEND_NEXT_ACTION, action_ids)
+        self.assertIn(server.SUBAGENT_OBSERVE_ACTION, action_ids)
+        self.assertIn(server.SUBAGENT_ATTACH_ACTION, action_ids)
 
     def test_pending_subagent_route_sends_one_message_and_clears_state(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
@@ -1863,6 +1872,235 @@ class ProcessPromptTests(unittest.TestCase):
             self.store.get_pending_subagent_target(
                 self.thread_key,
                 current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+
+    def test_control_command_clears_pending_subagent_target(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "control", self.user_id)
+
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+
+    def test_observe_command_clears_pending_subagent_target(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "observe", self.user_id)
+
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+
+    def test_reset_command_clears_pending_subagent_target(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "reset", self.user_id)
+
+        self.assertIsNone(self.store.get(self.thread_key))
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+
+    def test_fresh_command_clears_pending_subagent_target(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+        result = server.CodexRunResult(
+            session_id="sess-fresh",
+            text="fresh done",
+            exit_code=0,
+            raw_output="",
+            final_output="fresh done",
+            json_output="",
+            cleaned_output="fresh done",
+            timed_out=False,
+        )
+
+        with patch.object(server, "run_runtime_turn_with_updates", return_value=result):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "fresh new task", self.user_id)
+
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id="sess-fresh",
+                owner_user_id=self.user_id,
+            )
+        )
+
+    def test_handle_subagent_send_next_action_blocks_in_observe_mode(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
+
+        server.handle_subagent_send_next_action(
+            self.client,
+            MagicMock(),
+            thread_key=self.thread_key,
+            session_id=self.session_id,
+            subagent_thread_id="sub-1",
+            user_id=self.user_id,
+            channel_id=self.channel,
+            thread_ts=self.thread_ts,
+        )
+
+        self.assertIn("observe", self.client.messages[-1]["text"])
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+
+    def test_handle_subagent_send_cancel_action_clears_pending_target(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+
+        server.handle_subagent_send_cancel_action(
+            self.client,
+            thread_key=self.thread_key,
+            channel_id=self.channel,
+            thread_ts=self.thread_ts,
+        )
+
+        self.assertIn("已取消这次 subagent 单次路由", self.client.messages[-1]["text"])
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+
+    def test_handle_subagent_observe_action_attaches_subagent_in_observe_mode(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+
+        with patch.object(server, "attach_thread_to_session") as attach_thread_to_session:
+            server.handle_subagent_observe_action(
+                self.client,
+                thread_key=self.thread_key,
+                session_id=self.session_id,
+                subagent_thread_id="sub-1",
+                user_id=self.user_id,
+                channel_id=self.channel,
+                thread_ts=self.thread_ts,
+            )
+
+        attach_thread_to_session.assert_called_once_with(
+            self.client,
+            self.channel,
+            self.thread_ts,
+            self.thread_key,
+            session_id="sub-1",
+            user_id=self.user_id,
+            mode=server.SESSION_MODE_OBSERVE,
+            include_bootstrap=True,
+        )
+
+    def test_handle_subagent_attach_action_rejects_stale_main_session(self):
+        self.store.set(self.thread_key, "sess-new", owner_user_id=self.user_id)
+
+        with patch.object(server, "attach_thread_to_session") as attach_thread_to_session:
+            server.handle_subagent_attach_action(
+                self.client,
+                thread_key=self.thread_key,
+                session_id=self.session_id,
+                subagent_thread_id="sub-1",
+                user_id=self.user_id,
+                channel_id=self.channel,
+                thread_ts=self.thread_ts,
+            )
+
+        attach_thread_to_session.assert_not_called()
+        self.assertIn("当前主 session 已变化", self.client.messages[-1]["text"])
+
+    def test_handoff_rebuild_posts_pending_subagent_target_notice(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+        result = server.CodexRunResult(
+            session_id="sess-rebuilt",
+            text="handoff body",
+            exit_code=0,
+            raw_output="",
+            final_output="handoff body",
+            json_output="",
+            cleaned_output="handoff body",
+            timed_out=False,
+        )
+
+        with patch.object(server, "run_runtime_turn_with_updates", return_value=result):
+            with patch.object(server, "append_handoff_footer", return_value="handoff body"):
+                server.process_prompt(self.client, self.channel, self.thread_ts, "handoff", self.user_id)
+
+        self.assertTrue(
+            any("挂起的 subagent 单次路由" in message["text"] for message in self.client.messages),
+            self.client.messages,
+        )
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id="sess-rebuilt",
                 owner_user_id=self.user_id,
             )
         )
