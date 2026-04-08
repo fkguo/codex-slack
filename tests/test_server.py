@@ -2202,6 +2202,50 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertIn("<proposed_plan>", self.client.messages[1]["text"])
         self.assertIn("*Approved Plan*", self.client.messages[2]["blocks"][0]["text"]["text"])
 
+    def test_plan_mode_prompt_requires_full_plan_before_recommendation(self):
+        prompt = server.build_plan_mode_prompt("请先给方案")
+
+        self.assertIn("只要输出 recommendation，就必须同时输出完整 `<proposed_plan>...</proposed_plan>`", prompt)
+
+    def test_process_prompt_in_plan_mode_strips_recommendation_only_tag_from_visible_output(self):
+        self.store.set_collaboration_mode(
+            self.thread_key,
+            server.COLLABORATION_MODE_PLAN,
+            owner_user_id=self.user_id,
+        )
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="这里先给一点口头说明。\n<implementation_recommendation>here</implementation_recommendation>",
+            exit_code=0,
+            raw_output="",
+            final_output="这里先给一点口头说明。\n<implementation_recommendation>here</implementation_recommendation>",
+            json_output="",
+            cleaned_output="这里先给一点口头说明。\n<implementation_recommendation>here</implementation_recommendation>",
+            timed_out=False,
+        )
+
+        with patch.object(server, "run_runtime_turn_with_updates", return_value=result):
+            server.process_prompt(
+                self.client,
+                self.channel,
+                self.thread_ts,
+                "请更新方案",
+                self.user_id,
+            )
+
+        posted_texts = [message.get("text", "") for message in self.client.messages]
+        self.assertTrue(any("这里先给一点口头说明。" in text for text in posted_texts))
+        self.assertFalse(any("<implementation_recommendation>" in text for text in posted_texts))
+        self.assertFalse(any(message.get("blocks") for message in self.client.messages))
+
+    def test_sanitize_plan_mode_response_strips_recommendation_when_plan_present(self):
+        sanitized = server.sanitize_plan_mode_response_for_slack(
+            "<proposed_plan>\nhello\n</proposed_plan>\n<implementation_recommendation>clean</implementation_recommendation>"
+        )
+
+        self.assertIn("<proposed_plan>", sanitized)
+        self.assertNotIn("<implementation_recommendation>", sanitized)
+
     def test_build_thread_plan_actions_message_keeps_neutral_implementation_buttons_without_recommendation(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
         self.store.set_latest_plan(

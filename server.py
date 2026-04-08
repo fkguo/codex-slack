@@ -1557,6 +1557,29 @@ def extract_latest_implementation_recommendation(text):
     return normalize_plan_execution_mode(matches[-1])
 
 
+def strip_implementation_recommendation_tags(text):
+    normalized = str(text or "")
+    if not normalized:
+        return ""
+    stripped = re.sub(
+        r"\s*<implementation_recommendation>\s*.*?\s*</implementation_recommendation>\s*",
+        "\n",
+        normalized,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+    return stripped.strip()
+
+
+def sanitize_plan_mode_response_for_slack(text):
+    normalized = str(text or "")
+    if not normalized:
+        return ""
+    if extract_latest_implementation_recommendation(normalized) is None:
+        return normalized.strip()
+    return strip_implementation_recommendation_tags(normalized)
+
+
 def format_relative_timestamp(timestamp):
     if not isinstance(timestamp, int) or timestamp <= 0:
         return "-"
@@ -2740,9 +2763,10 @@ def build_plan_refinement_prompt(plan_text):
         "- 先不要开始实施\n"
         "- 结合当前 thread 里已经出现的补充、约束或新信息继续细化\n"
         "- 即使总体方向不变，也请输出一版完整更新后的 `<proposed_plan>`，不要只给口头说明\n"
-        "- 如果你能明确判断更适合 `Implement clean` 还是 `Implement here`，就在 `<proposed_plan>` 后额外输出"
+        "- 如果你能明确判断更适合 `Implement clean` 还是 `Implement here`，就在完整的 `<proposed_plan>` 后额外输出"
         " `<implementation_recommendation>clean</implementation_recommendation>` 或"
         " `<implementation_recommendation>here</implementation_recommendation>`\n"
+        "- 绝对不要单独输出 `<implementation_recommendation>`；只要输出 recommendation，就必须同时输出完整 `<proposed_plan>...</proposed_plan>`\n"
         "- 如果没有明确推荐，就不要输出 `<implementation_recommendation>`\n\n"
         "Current approved plan:\n"
         f"{plan_text}"
@@ -2755,10 +2779,11 @@ def build_plan_mode_prompt(prompt):
         return normalized_prompt
     return (
         f"{normalized_prompt}\n\n"
-        "如果这次回复会产出 `<proposed_plan>`，请额外遵守以下约定：\n"
-        "- 如能明确判断更适合 `Implement clean` 还是 `Implement here`，就在 `<proposed_plan>` 后追加"
+        "如果这次回复要给出方案，请输出完整 `<proposed_plan>...</proposed_plan>`，并额外遵守以下约定：\n"
+        "- 如能明确判断更适合 `Implement clean` 还是 `Implement here`，就在完整的 `<proposed_plan>` 后追加"
         " `<implementation_recommendation>clean</implementation_recommendation>` 或"
         " `<implementation_recommendation>here</implementation_recommendation>`\n"
+        "- 绝对不要单独输出 `<implementation_recommendation>`；只要输出 recommendation，就必须同时输出完整 `<proposed_plan>...</proposed_plan>`\n"
         "- 如果没有明确推荐，就不要输出 `<implementation_recommendation>`"
     )
 
@@ -4203,6 +4228,7 @@ def handle_keep_planning_action(client, channel_id, thread_ts, thread_key, *, us
         f"- workdir: `{details['workdir']}`\n\n"
         f"{codex_result.text}"
     )
+    result = sanitize_plan_mode_response_for_slack(result)
     post_chunks(client, channel_id, thread_ts, result)
     if response_contains_proposed_plan(codex_result.text):
         persist_latest_proposed_plan(
@@ -4807,6 +4833,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                 )
                 current_session_origin = get_session_origin(thread_key)
                 current_session_cwd = get_session_cwd(thread_key)
+                thread_collaboration_mode = resolve_collaboration_mode(thread_key)
 
                 if is_effort_command(prompt):
                     effort_payload = strip_effort_command(prompt)
@@ -5016,7 +5043,10 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         existing_session_id=current_session_id,
                         next_session_id=next_session_id,
                     )
-                    post_chunks(client, channel, thread_ts, maybe_prefix_thread_output(next_session_id or current_session_id, result))
+                    visible_result = maybe_prefix_thread_output(next_session_id or current_session_id, result)
+                    if thread_collaboration_mode == COLLABORATION_MODE_PLAN:
+                        visible_result = sanitize_plan_mode_response_for_slack(visible_result)
+                    post_chunks(client, channel, thread_ts, visible_result)
                     if pending_target_rebuild_notice:
                         client.chat_postMessage(
                             channel=channel,
@@ -5124,7 +5154,10 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         existing_session_id=current_session_id,
                         next_session_id=next_session_id,
                     )
-                    post_chunks(client, channel, thread_ts, maybe_prefix_thread_output(next_session_id or current_session_id, result))
+                    visible_result = maybe_prefix_thread_output(next_session_id or current_session_id, result)
+                    if thread_collaboration_mode == COLLABORATION_MODE_PLAN:
+                        visible_result = sanitize_plan_mode_response_for_slack(visible_result)
+                    post_chunks(client, channel, thread_ts, visible_result)
                     if pending_target_rebuild_notice:
                         client.chat_postMessage(
                             channel=channel,
@@ -5688,6 +5721,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             f"已发送给 `{format_subagent_short_name(subagent_info.get('agent_nickname'), subagent_info.get('agent_role'), subagent_thread_id)}`；"
                             "当前目标已恢复为 `main`。"
                         )
+                        if thread_collaboration_mode == COLLABORATION_MODE_PLAN:
+                            routed_text = sanitize_plan_mode_response_for_slack(routed_text)
                         log_session_event(
                             "subagent_send_next",
                             thread_key,
@@ -5902,7 +5937,10 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     existing_session_id=existing_session_id,
                     next_session_id=next_session_id,
                 )
-                post_chunks(client, channel, thread_ts, maybe_prefix_thread_output(next_session_id, result))
+                visible_result = maybe_prefix_thread_output(next_session_id, result)
+                if thread_collaboration_mode == COLLABORATION_MODE_PLAN:
+                    visible_result = sanitize_plan_mode_response_for_slack(visible_result)
+                post_chunks(client, channel, thread_ts, visible_result)
                 if response_contains_proposed_plan(result):
                     persist_latest_proposed_plan(
                         thread_key,
@@ -6664,6 +6702,7 @@ def build_app():
             f"- workdir: `{workdir}`\n\n"
             f"{codex_result.text}"
         )
+        result = sanitize_plan_mode_response_for_slack(result)
         post_chunks(client, channel_id, thread_ts, result)
         if response_contains_proposed_plan(codex_result.text):
             persist_latest_proposed_plan(
