@@ -437,7 +437,6 @@ class AppServerRuntime:
     @staticmethod
     def _extract_final_text_from_session(session):
         last_unknown_phase_text = ""
-        last_completed_agent_message_text = ""
         last_plan_text = ""
 
         for event in reversed(session.raw_events):
@@ -461,16 +460,12 @@ class AppServerRuntime:
                 continue
             if not text:
                 continue
-            if not last_completed_agent_message_text:
-                last_completed_agent_message_text = text
             phase = item.get("phase")
             if phase == "final_answer":
                 return text
             if phase is None and not last_unknown_phase_text:
                 last_unknown_phase_text = text
 
-        if last_completed_agent_message_text:
-            return last_completed_agent_message_text
         if last_plan_text:
             return f"<proposed_plan>\n{last_plan_text.rstrip()}\n</proposed_plan>"
         return last_unknown_phase_text

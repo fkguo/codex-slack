@@ -102,6 +102,10 @@ REQUEST_USER_INPUT_OPEN_ACTION = "request_user_input_open"
 REQUEST_USER_INPUT_CANCEL_ACTION = "request_user_input_cancel"
 REQUEST_USER_INPUT_SUBMIT_CALLBACK = "request_user_input_submit"
 REQUEST_USER_INPUT_OTHER_VALUE = "__other__"
+SUBAGENT_SEND_NEXT_ACTION = "subagent_send_next"
+SUBAGENT_SEND_CANCEL_ACTION = "subagent_send_cancel"
+SUBAGENT_OBSERVE_ACTION = "subagent_observe"
+SUBAGENT_ATTACH_ACTION = "subagent_attach"
 DEFAULT_REASONING_EFFORT = "xhigh"
 SUPPORTED_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 DEFAULT_WATCH_POLL_SECONDS = 5
@@ -110,6 +114,7 @@ DEFAULT_WATCH_FS_DEBOUNCE_SECONDS = 0.2
 DEFAULT_PROGRESS_HEARTBEAT_SECONDS = 300
 DEFAULT_PROGRESS_POLL_SECONDS = 15
 DEFAULT_PROGRESS_BATCH_SECONDS = 5.0
+DEFAULT_PENDING_SUBAGENT_TTL_SECONDS = 600
 MAX_APP_SERVER_RETRIES = 2
 DEFAULT_APP_SERVER_RESUME_MAX_RETRIES = 2
 MAX_WATCH_READ_FAILURES = 2
@@ -185,6 +190,16 @@ def sanitize_inline_code_text(value, max_length=120):
     return text[: max_length - 3].rstrip() + "..."
 
 
+def normalize_subagent_role(value):
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def normalize_subagent_nickname(value):
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
 class SlackThreadSessionStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -253,6 +268,13 @@ class SlackThreadSessionStore:
             ).strip()
             if latest_plan_execution_session_id:
                 entry["latest_plan_execution_session_id"] = latest_plan_execution_session_id
+            pending_subagent_target = self._normalize_pending_subagent_target(
+                value.get("pending_subagent_target"),
+                current_session_id=session_id or None,
+                owner_user_id=entry.get("owner_user_id"),
+            )
+            if pending_subagent_target:
+                entry["pending_subagent_target"] = pending_subagent_target
             if not self._has_persisted_state(entry):
                 continue
             normalized[key] = entry
@@ -270,8 +292,64 @@ class SlackThreadSessionStore:
                 "progress_updates" in entry,
                 bool(entry.get("collaboration_mode")),
                 bool(entry.get("latest_plan_text")),
+                bool(entry.get("pending_subagent_target")),
             ]
         )
+
+    @staticmethod
+    def _normalize_pending_subagent_target(value, *, current_session_id=None, owner_user_id=None):
+        if not isinstance(value, dict):
+            return None
+        thread_id = str(value.get("thread_id") or "").strip()
+        session_id = str(value.get("session_id") or "").strip()
+        stored_owner_user_id = str(value.get("owner_user_id") or "").strip()
+        armed_at = value.get("armed_at")
+        try:
+            armed_at = int(armed_at)
+        except (TypeError, ValueError):
+            return None
+        if not thread_id or not session_id or not stored_owner_user_id or armed_at <= 0:
+            return None
+        if current_session_id and session_id != str(current_session_id).strip():
+            return None
+        if owner_user_id and stored_owner_user_id != str(owner_user_id).strip():
+            return None
+        raw_ttl = str(
+            ENV.get(
+                "CODEX_SLACK_PENDING_SUBAGENT_TTL_SECONDS",
+                DEFAULT_PENDING_SUBAGENT_TTL_SECONDS,
+            )
+        ).strip()
+        try:
+            ttl_seconds = max(60, int(raw_ttl))
+        except ValueError:
+            ttl_seconds = DEFAULT_PENDING_SUBAGENT_TTL_SECONDS
+        if (int(time.time()) - armed_at) > ttl_seconds:
+            return None
+        normalized = {
+            "thread_id": thread_id,
+            "session_id": session_id,
+            "owner_user_id": stored_owner_user_id,
+            "armed_at": armed_at,
+        }
+        agent_nickname = normalize_subagent_nickname(value.get("agent_nickname"))
+        if agent_nickname:
+            normalized["agent_nickname"] = agent_nickname
+        agent_role = normalize_subagent_role(value.get("agent_role"))
+        if agent_role:
+            normalized["agent_role"] = agent_role
+        return normalized
+
+    @staticmethod
+    def _preserve_pending_subagent_target(existing_entry, session_id):
+        pending_target = SlackThreadSessionStore._normalize_pending_subagent_target(
+            read_field(existing_entry or {}, "pending_subagent_target"),
+            current_session_id=session_id,
+            owner_user_id=read_field(existing_entry or {}, "owner_user_id"),
+        )
+        if pending_target:
+            return pending_target
+        return None
 
     def _save_locked(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -394,6 +472,31 @@ class SlackThreadSessionStore:
             value = str(entry.get("latest_plan_execution_session_id") or "").strip()
             return value or None
 
+    def get_pending_subagent_target(self, key, *, current_session_id=None, owner_user_id=None):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            pending_target = self._normalize_pending_subagent_target(
+                entry.get("pending_subagent_target"),
+                current_session_id=current_session_id or entry.get("session_id"),
+                owner_user_id=owner_user_id or entry.get("owner_user_id"),
+            )
+            if pending_target:
+                if pending_target != entry.get("pending_subagent_target"):
+                    entry["pending_subagent_target"] = pending_target
+                    entry["updated_at"] = int(time.time())
+                    self._save_locked()
+                return dict(pending_target)
+            if "pending_subagent_target" in entry:
+                entry.pop("pending_subagent_target", None)
+                if self._has_persisted_state(entry):
+                    entry["updated_at"] = int(time.time())
+                else:
+                    self._sessions.pop(key, None)
+                self._save_locked()
+            return None
+
     def find_owner_for_session(self, session_id):
         with self._lock:
             for entry in self._sessions.values():
@@ -451,6 +554,9 @@ class SlackThreadSessionStore:
             )
             if effective_session_cwd:
                 entry["session_cwd"] = effective_session_cwd
+            pending_subagent_target = self._preserve_pending_subagent_target(existing_entry, session_id)
+            if pending_subagent_target:
+                entry["pending_subagent_target"] = pending_subagent_target
             self._sessions[key] = entry
             self._save_locked()
 
@@ -527,9 +633,63 @@ class SlackThreadSessionStore:
             )
             if effective_session_cwd:
                 entry["session_cwd"] = effective_session_cwd
+            pending_subagent_target = self._preserve_pending_subagent_target(existing_entry, session_id)
+            if pending_subagent_target:
+                entry["pending_subagent_target"] = pending_subagent_target
             self._sessions[key] = entry
             self._save_locked()
             return previous_session_id, None
+
+    def set_pending_subagent_target(
+        self,
+        key,
+        *,
+        thread_id,
+        agent_nickname,
+        agent_role,
+        owner_user_id,
+        session_id,
+        armed_at=None,
+    ):
+        normalized_pending_target = self._normalize_pending_subagent_target(
+            {
+                "thread_id": thread_id,
+                "agent_nickname": agent_nickname,
+                "agent_role": agent_role,
+                "owner_user_id": owner_user_id,
+                "armed_at": armed_at or int(time.time()),
+                "session_id": session_id,
+            },
+            current_session_id=session_id,
+            owner_user_id=owner_user_id,
+        )
+        if not normalized_pending_target:
+            return None
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["pending_subagent_target"] = normalized_pending_target
+            existing_entry["updated_at"] = int(time.time())
+            if owner_user_id:
+                existing_entry["owner_user_id"] = owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
+        return dict(normalized_pending_target)
+
+    def clear_pending_subagent_target(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry or "pending_subagent_target" not in entry:
+                return None
+            cleared = entry.pop("pending_subagent_target", None)
+            if self._has_persisted_state(entry):
+                entry["updated_at"] = int(time.time())
+                self._save_locked()
+            else:
+                self._sessions.pop(key, None)
+                self._save_locked()
+            if isinstance(cleared, dict):
+                return dict(cleared)
+            return None
 
     def set_reasoning_effort(self, key, reasoning_effort, owner_user_id=None):
         normalized_effort = normalize_reasoning_effort(reasoning_effort)
@@ -686,6 +846,7 @@ class SlackThreadSessionStore:
             entry.pop("mode", None)
             entry.pop("session_origin", None)
             entry.pop("session_cwd", None)
+            entry.pop("pending_subagent_target", None)
             entry["updated_at"] = int(time.time())
             if self._has_persisted_state(entry):
                 self._save_locked()
@@ -930,6 +1091,11 @@ def is_sessions_command(text):
 
 def strip_sessions_command(text):
     return strip_command_payload(text, "sessions") or ""
+
+
+def is_subagents_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/subagents", "subagents", "agents", "/agents"}
 
 
 def is_watch_command(text):
@@ -1258,6 +1424,105 @@ def format_relative_timestamp(timestamp):
     return f"{days}d {hours}h ago" if hours else f"{days}d ago"
 
 
+def get_pending_subagent_ttl_seconds():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_PENDING_SUBAGENT_TTL_SECONDS",
+            DEFAULT_PENDING_SUBAGENT_TTL_SECONDS,
+        )
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_PENDING_SUBAGENT_TTL_SECONDS
+    return max(60, value)
+
+
+def format_subagent_source_label(agent_nickname=None, agent_role=None, thread_id=None):
+    nickname = normalize_subagent_nickname(agent_nickname) or "Subagent"
+    role = normalize_subagent_role(agent_role)
+    if role:
+        return f"{nickname} · {role}"
+    if thread_id:
+        return f"{nickname} · {thread_id}"
+    return nickname
+
+
+def format_subagent_short_name(agent_nickname=None, agent_role=None, thread_id=None):
+    nickname = normalize_subagent_nickname(agent_nickname) or "Subagent"
+    role = normalize_subagent_role(agent_role)
+    if role:
+        return f"{nickname} ({role})"
+    if thread_id:
+        return f"{nickname} ({thread_id})"
+    return nickname
+
+
+def prepend_source_header(text, *, agent_nickname=None, agent_role=None, thread_id=None):
+    normalized_text = str(text or "").strip()
+    label = format_subagent_source_label(
+        agent_nickname=agent_nickname,
+        agent_role=agent_role,
+        thread_id=thread_id,
+    )
+    if not normalized_text:
+        return label
+    return f"{label}\n\n{normalized_text}"
+
+
+def extract_thread_agent_metadata(thread_read_response):
+    thread = read_field(thread_read_response, "thread", thread_read_response)
+    return {
+        "thread_id": str(read_field(thread, "id", "") or "").strip() or None,
+        "agent_nickname": normalize_subagent_nickname(read_field(thread, "agentNickname")),
+        "agent_role": normalize_subagent_role(read_field(thread, "agentRole")),
+        "status": extract_thread_status_type(thread_read_response),
+        "updated_at": extract_thread_updated_at(thread_read_response),
+    }
+
+
+def maybe_prefix_thread_output(session_id, text, *, thread_read_response=None):
+    if not session_id:
+        return str(text or "").strip()
+    response = thread_read_response
+    if response is None:
+        with suppress(Exception):
+            response = read_thread_response(session_id, include_turns=False)
+    if response is None:
+        return str(text or "").strip()
+    metadata = extract_thread_agent_metadata(response)
+    if not metadata.get("agent_nickname") and not metadata.get("agent_role"):
+        return str(text or "").strip()
+    return prepend_source_header(
+        text,
+        agent_nickname=metadata.get("agent_nickname"),
+        agent_role=metadata.get("agent_role"),
+        thread_id=metadata.get("thread_id"),
+    )
+
+
+def get_pending_subagent_state_lines(thread_key, *, current_session_id=None, session_store=None):
+    session_store = session_store or SESSION_STORE
+    pending_target = session_store.get_pending_subagent_target(
+        thread_key,
+        current_session_id=current_session_id,
+    )
+    if not pending_target:
+        return ["- pending_subagent_target: `-`"]
+    label = format_subagent_short_name(
+        pending_target.get("agent_nickname"),
+        pending_target.get("agent_role"),
+        pending_target.get("thread_id"),
+    )
+    return [
+        (
+            "- pending_subagent_target: "
+            f"`{label}` thread=`{pending_target.get('thread_id') or '-'}` "
+            f"armed_at=`{format_relative_timestamp(pending_target.get('armed_at'))}`"
+        )
+    ]
+
+
 def persist_latest_proposed_plan(thread_key, result_text, session_id=None, owner_user_id=None):
     plan_text = extract_latest_proposed_plan(result_text)
     if not plan_text:
@@ -1429,6 +1694,72 @@ def get_attach_error(user_id, session_id, session_store=None):
         return None
 
     return get_shared_attach_error()
+
+
+def attach_thread_to_session(
+    client,
+    channel,
+    thread_ts,
+    thread_key,
+    *,
+    session_id,
+    user_id,
+    mode=SESSION_MODE_OBSERVE,
+    include_bootstrap=False,
+):
+    normalized_session_id = str(session_id or "").strip()
+    attach_error = get_attach_error(user_id, normalized_session_id)
+    if attach_error:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=attach_error)
+        return False
+
+    attached_session_cwd = None
+    with suppress(Exception):
+        attached_session_cwd = read_thread_cwd(normalized_session_id)
+
+    previous_session_id, attach_error = SESSION_STORE.attach_session(
+        thread_key,
+        normalized_session_id,
+        owner_user_id=user_id,
+        allow_unseen=is_unseen_attach_allowed(user_id),
+        mode=mode,
+        session_cwd=attached_session_cwd,
+    )
+    if attach_error:
+        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=attach_error)
+        return False
+
+    ACTIVE_TURN_REGISTRY.clear_for_thread(thread_key)
+    stop_watcher(thread_key)
+    SESSION_STORE.clear_pending_subagent_target(thread_key)
+    log_session_event(
+        "attach",
+        thread_key,
+        existing_session_id=previous_session_id,
+        next_session_id=normalized_session_id,
+    )
+
+    attach_cwd_note = (
+        f"\n\n已识别这个 session 的工作目录：`{attached_session_cwd}`。"
+        if attached_session_cwd
+        else "\n\n暂时还没读到这个 session 的工作目录。"
+    )
+    mode_text = (
+        "默认已进入 `observe` 模式。你可以先用 `watch`、`where`、`session` 查看 thread 对话。"
+        " 如果你确认要由 Slack 接管，再发送 `control` 或 `takeover`。"
+        if mode == SESSION_MODE_OBSERVE
+        else "当前已直接进入 `control` 模式，后续普通消息会继续发给这个 session。"
+    )
+    message = (
+        f"<@{user_id}> 当前 Slack thread 已绑定到 Codex session `{normalized_session_id}`。\n\n"
+        f"{mode_text}{attach_cwd_note}"
+    )
+    if include_bootstrap:
+        with suppress(Exception):
+            watch_text, _last_event_key = build_watch_bootstrap(normalized_session_id)
+            message = f"{message}\n\n{watch_text}"
+    client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=message)
+    return True
 
 
 def get_session_mode(thread_key, session_store=None):
@@ -1737,6 +2068,200 @@ def decode_thread_collaboration_mode_value(raw_value):
     if not thread_key or not target_mode:
         raise RuntimeError("collaboration mode payload incomplete")
     return thread_key, target_mode
+
+
+def encode_subagent_action_value(thread_key, session_id, subagent_thread_id):
+    return json.dumps(
+        {
+            "thread_key": str(thread_key or "").strip(),
+            "session_id": str(session_id or "").strip(),
+            "subagent_thread_id": str(subagent_thread_id or "").strip(),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def decode_subagent_action_value(raw_value):
+    payload = json.loads(str(raw_value or ""))
+    if not isinstance(payload, dict):
+        raise RuntimeError("subagent action payload invalid")
+    thread_key = str(payload.get("thread_key") or "").strip()
+    session_id = str(payload.get("session_id") or "").strip()
+    subagent_thread_id = str(payload.get("subagent_thread_id") or "").strip()
+    if not thread_key or not session_id or not subagent_thread_id:
+        raise RuntimeError("subagent action payload incomplete")
+    return thread_key, session_id, subagent_thread_id
+
+
+def build_subagent_send_cancel_blocks(thread_key, session_id):
+    return [
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": SUBAGENT_SEND_CANCEL_ACTION,
+                    "text": {"type": "plain_text", "text": "Cancel"},
+                    "value": encode_subagent_action_value(thread_key, session_id, "cancel"),
+                }
+            ],
+        }
+    ]
+
+
+def extract_subagent_candidates_from_thread(thread_read_response, main_thread_id):
+    candidates = {}
+    thread = read_field(thread_read_response, "thread", thread_read_response)
+    turns = read_field(thread, "turns", []) or []
+    for turn in turns:
+        for item in read_field(turn, "items", []) or []:
+            root = read_root(item)
+            if str(read_field(root, "type", "") or "").strip() != "collabAgentToolCall":
+                continue
+            tool_name = str(read_field(root, "tool", "") or "").strip()
+            if tool_name not in {"spawn_agent", "send_input", "resume_agent", "wait", "wait_agent", "close_agent"}:
+                continue
+            sender_thread_id = str(read_field(root, "senderThreadId", "") or "").strip()
+            if sender_thread_id and sender_thread_id != str(main_thread_id or "").strip():
+                continue
+            receiver_thread_ids = read_field(root, "receiverThreadIds", []) or []
+            agents_states = read_field(root, "agentsStates", {}) or {}
+            for receiver_thread_id in receiver_thread_ids:
+                normalized_thread_id = str(receiver_thread_id or "").strip()
+                if not normalized_thread_id or normalized_thread_id == str(main_thread_id or "").strip():
+                    continue
+                candidate = candidates.setdefault(
+                    normalized_thread_id,
+                    {
+                        "thread_id": normalized_thread_id,
+                        "status": None,
+                        "updated_at": None,
+                    },
+                )
+                state = read_field(agents_states, normalized_thread_id, {}) or {}
+                state_status = str(read_field(state, "status", "") or "").strip()
+                if state_status:
+                    candidate["status"] = state_status
+    return candidates
+
+
+def discover_subagents(main_session_id):
+    if not main_session_id:
+        return []
+    main_thread_response = read_thread_response(main_session_id, include_turns=True)
+    candidates = extract_subagent_candidates_from_thread(main_thread_response, main_session_id)
+    subagents = []
+    for thread_id, candidate in candidates.items():
+        try:
+            thread_response = read_thread_response(thread_id, include_turns=False)
+        except Exception:
+            continue
+        metadata = extract_thread_agent_metadata(thread_response)
+        subagents.append(
+            {
+                "thread_id": thread_id,
+                "agent_nickname": metadata.get("agent_nickname") or candidate.get("agent_nickname"),
+                "agent_role": metadata.get("agent_role") or candidate.get("agent_role"),
+                "status": metadata.get("status") or candidate.get("status") or "unknown",
+                "updated_at": metadata.get("updated_at") or candidate.get("updated_at"),
+            }
+        )
+    subagents.sort(key=lambda item: int(item.get("updated_at") or 0), reverse=True)
+    return subagents
+
+
+def find_subagent_for_main_session(main_session_id, subagent_thread_id):
+    normalized_thread_id = str(subagent_thread_id or "").strip()
+    if not main_session_id or not normalized_thread_id:
+        return None
+    for item in discover_subagents(main_session_id):
+        if item.get("thread_id") == normalized_thread_id:
+            return item
+    return None
+
+
+def build_subagents_message(thread_key, session_id, subagents, *, session_mode):
+    intro_lines = [
+        "*Subagents*",
+        f"Main session: `{session_id}`",
+    ]
+    if session_mode == SESSION_MODE_OBSERVE:
+        intro_lines.append("当前 Slack thread 处于 `observe` 模式。你可以查看和只读进入 subagent，但不能 arm `Send next message`。")
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "\n".join(intro_lines)},
+        }
+    ]
+    if not subagents:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": "_当前主 thread 还没有发现可用的 subagents。_"},
+            }
+        )
+        return "Subagents", blocks
+
+    for item in subagents:
+        label = format_subagent_short_name(
+            item.get("agent_nickname"),
+            item.get("agent_role"),
+            item.get("thread_id"),
+        )
+        updated_at = format_relative_timestamp(item.get("updated_at"))
+        blocks.extend(
+            [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*{label}*\n"
+                            f"thread_id: `{item.get('thread_id')}`\n"
+                            f"status: `{item.get('status') or 'unknown'}`\n"
+                            f"updated: `{updated_at}`"
+                        ),
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "action_id": SUBAGENT_SEND_NEXT_ACTION,
+                            "text": {"type": "plain_text", "text": "Send next message"},
+                            "value": encode_subagent_action_value(
+                                thread_key,
+                                session_id,
+                                item.get("thread_id"),
+                            ),
+                        },
+                        {
+                            "type": "button",
+                            "action_id": SUBAGENT_OBSERVE_ACTION,
+                            "text": {"type": "plain_text", "text": "Observe"},
+                            "value": encode_subagent_action_value(
+                                thread_key,
+                                session_id,
+                                item.get("thread_id"),
+                            ),
+                        },
+                        {
+                            "type": "button",
+                            "action_id": SUBAGENT_ATTACH_ACTION,
+                            "text": {"type": "plain_text", "text": "Attach"},
+                            "value": encode_subagent_action_value(
+                                thread_key,
+                                session_id,
+                                item.get("thread_id"),
+                            ),
+                        },
+                    ],
+                },
+            ]
+        )
+    return "Subagents", blocks
 
 
 def build_thread_collaboration_mode_message(thread_key, session_id=None, collaboration_mode=None):
@@ -2926,10 +3451,11 @@ def build_watch_bootstrap(session_id):
     events = read_conversation_events(session_id)
     bootstrap_events = get_latest_completed_turn_events(events) or get_recent_turn_events(events)
     last_event_key = get_event_key(bootstrap_events[-1]) if bootstrap_events else None
-    return format_conversation_events(bootstrap_events, heading="最近一轮对话:"), last_event_key
+    text = format_conversation_events(bootstrap_events, heading="最近一轮对话:")
+    return maybe_prefix_thread_output(session_id, text), last_event_key
 
 
-def advance_watch_cursor(events, last_event_key):
+def advance_watch_cursor(events, last_event_key, session_id=None):
     try:
         new_events = get_events_after_key(events, last_event_key)
     except WatchAnchorLostError:
@@ -2941,7 +3467,7 @@ def advance_watch_cursor(events, last_event_key):
         return None, last_event_key, False
 
     new_last_event_key = get_event_key(new_events[-1])
-    return format_conversation_events(new_events), new_last_event_key, False
+    return maybe_prefix_thread_output(session_id, format_conversation_events(new_events)), new_last_event_key, False
 
 
 def capture_progress_baseline(session_id):
@@ -3020,6 +3546,8 @@ def run_runtime_turn_with_updates(
     owner_user_id=None,
     session_origin=SESSION_ORIGIN_SLACK,
     collaboration_mode=None,
+    track_active_turn=True,
+    persist_session_binding=True,
 ):
     runtime = get_app_runtime()
     session_id_tracker = SessionIdTracker(session_id=session_id)
@@ -3033,14 +3561,16 @@ def run_runtime_turn_with_updates(
 
     def on_turn_started(started_session_id, turn_id):
         session_id_tracker.set(started_session_id)
-        ACTIVE_TURN_REGISTRY.set(thread_key, started_session_id, turn_id)
-        SESSION_STORE.set(
-            thread_key,
-            started_session_id,
-            owner_user_id=owner_user_id,
-            session_origin=session_origin,
-            session_cwd=workdir_override,
-        )
+        if track_active_turn:
+            ACTIVE_TURN_REGISTRY.set(thread_key, started_session_id, turn_id)
+        if persist_session_binding:
+            SESSION_STORE.set(
+                thread_key,
+                started_session_id,
+                owner_user_id=owner_user_id,
+                session_origin=session_origin,
+                session_cwd=workdir_override,
+            )
     def on_step(step):
         if not enable_progress or not step.text or step.item_type != "agentMessage":
             return
@@ -3107,7 +3637,8 @@ def run_runtime_turn_with_updates(
             )
         raise
     finally:
-        ACTIVE_TURN_REGISTRY.clear_for_thread(thread_key)
+        if track_active_turn:
+            ACTIVE_TURN_REGISTRY.clear_for_thread(thread_key)
         if progress_reporter:
             progress_reporter.flush()
             progress_reporter.close()
@@ -3527,7 +4058,11 @@ async def watch_loop_async(client, channel, thread_ts, thread_key, session_id, s
                 continue
 
             events = extract_conversation_events(thread_response)
-            message, current_last_event_key, _rebased = advance_watch_cursor(events, current_last_event_key)
+            message, current_last_event_key, _rebased = advance_watch_cursor(
+                events,
+                current_last_event_key,
+                session_id,
+            )
             last_snapshot = snapshot
             if not message:
                 continue
@@ -3959,7 +4494,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         existing_session_id=current_session_id,
                         next_session_id=next_session_id,
                     )
-                    post_chunks(client, channel, thread_ts, result)
+                    post_chunks(client, channel, thread_ts, maybe_prefix_thread_output(next_session_id or current_session_id, result))
                     if response_contains_proposed_plan(result):
                         persist_latest_proposed_plan(
                             thread_key,
@@ -4055,7 +4590,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         existing_session_id=current_session_id,
                         next_session_id=next_session_id,
                     )
-                    post_chunks(client, channel, thread_ts, result)
+                    post_chunks(client, channel, thread_ts, maybe_prefix_thread_output(next_session_id or current_session_id, result))
                     if response_contains_proposed_plan(result):
                         persist_latest_proposed_plan(
                             thread_key,
@@ -4166,6 +4701,37 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     )
                     return
 
+                if is_subagents_command(prompt):
+                    if not current_session_id:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 当前 Slack thread 还没有绑定 session，暂时无法查看 subagents。",
+                        )
+                        return
+                    try:
+                        subagents = discover_subagents(current_session_id)
+                    except Exception as exc:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=f"<@{user_id}> 读取当前主 thread 的 subagents 失败。\n\n{exc}",
+                        )
+                        return
+                    text, blocks = build_subagents_message(
+                        thread_key,
+                        current_session_id,
+                        subagents,
+                        session_mode=current_session_mode,
+                    )
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=text,
+                        blocks=blocks,
+                    )
+                    return
+
                 if is_unsupported_watch_command(prompt):
                     client.chat_postMessage(
                         channel=channel,
@@ -4241,6 +4807,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         return
                     watch_was_stopped = stop_watcher(thread_key)
                     SESSION_STORE.set_mode(thread_key, SESSION_MODE_CONTROL)
+                    SESSION_STORE.clear_pending_subagent_target(thread_key)
                     watch_note = ""
                     if watch_was_stopped:
                         watch_note = "\n\n已自动停止当前 Slack thread 的 `watch`，避免你在 Slack 主控时收到重复镜像消息。"
@@ -4264,6 +4831,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         )
                         return
                     SESSION_STORE.set_mode(thread_key, SESSION_MODE_OBSERVE)
+                    SESSION_STORE.clear_pending_subagent_target(thread_key)
                     watch_hint = ""
                     if get_watcher(thread_key):
                         watch_hint = (
@@ -4299,6 +4867,10 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     collaboration_lines = get_collaboration_mode_state_lines(thread_key)
                     progress_lines = get_progress_updates_state_lines(thread_key)
                     plan_lines = get_plan_state_lines(thread_key)
+                    pending_subagent_lines = get_pending_subagent_state_lines(
+                        thread_key,
+                        current_session_id=current_session_id,
+                    )
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
@@ -4324,6 +4896,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             + "\n".join(progress_lines)
                             + "\n"
                             + "\n".join(plan_lines)
+                            + "\n"
+                            + "\n".join(pending_subagent_lines)
                             + "\n"
                             "如果你想让终端继续同一个会话，可以在终端里使用这个 `session_id` 执行 `codex exec resume ...`。"
                         ),
@@ -4355,9 +4929,6 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                 if is_attach_command(prompt):
                     attach_session_id = strip_attach_command(prompt)
                     normalized_session_id = (attach_session_id or "").strip()
-                    previous_session_id = None
-                    attached_session_cwd = None
-                    attach_cwd_note = ""
                     attach_error = None
                     recent_index = parse_attach_recent_selector(normalized_session_id)
                     if recent_index is not None:
@@ -4375,49 +4946,17 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             "`attach` 目前只接受 Codex session UUID，例如 "
                             "`attach 019d5868-71ba-7101-9143-81867f3db5bf`。"
                         )
-                    if not attach_error:
-                        with suppress(Exception):
-                            attached_session_cwd = read_thread_cwd(normalized_session_id)
-                        previous_session_id, attach_error = SESSION_STORE.attach_session(
-                            thread_key,
-                            normalized_session_id,
-                            owner_user_id=user_id,
-                            allow_unseen=is_unseen_attach_allowed(user_id),
-                            mode=SESSION_MODE_OBSERVE,
-                            session_cwd=attached_session_cwd,
-                        )
                     if attach_error:
                         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=attach_error)
                         return
-
-                    if attached_session_cwd:
-                        attach_cwd_note = (
-                            f"\n\n已识别这个 session 的工作目录：`{attached_session_cwd}`。"
-                            " 之后如果你在 Slack 里 `control` / `takeover`，会继续沿用这个目录。"
-                        )
-                    else:
-                        attach_cwd_note = (
-                            "\n\n暂时还没读到这个 session 的工作目录。"
-                            " 如果之后你在 Slack 里 `control` / `takeover`，服务会再尝试自动获取。"
-                        )
-
-                    log_session_event(
-                        "attach",
+                    attach_thread_to_session(
+                        client,
+                        channel,
+                        thread_ts,
                         thread_key,
-                        existing_session_id=previous_session_id,
-                        next_session_id=normalized_session_id,
-                    )
-                    ACTIVE_TURN_REGISTRY.clear_for_thread(thread_key)
-                    stop_watcher(thread_key)
-                    client.chat_postMessage(
-                        channel=channel,
-                        thread_ts=thread_ts,
-                        text=(
-                            f"<@{user_id}> 当前 Slack thread 已绑定到 Codex session `{normalized_session_id}`。\n\n"
-                            "默认已进入 `observe` 模式。你可以先用 `watch`、`where`、`session` 查看 thread 对话。"
-                            " 如果你确认要由 Slack 接管，再发送 `control` 或 `takeover`。"
-                            f"{attach_cwd_note}"
-                        ),
+                        session_id=normalized_session_id,
+                        user_id=user_id,
+                        mode=SESSION_MODE_OBSERVE,
                     )
                     return
 
@@ -4425,6 +4964,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     previous_session_id = SESSION_STORE.get(thread_key)
                     ACTIVE_TURN_REGISTRY.clear_for_thread(thread_key)
                     stop_watcher(thread_key)
+                    SESSION_STORE.clear_pending_subagent_target(thread_key)
                     SESSION_STORE.delete(thread_key)
                     log_session_event("reset", thread_key, existing_session_id=previous_session_id)
                     client.chat_postMessage(
@@ -4463,6 +5003,9 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                 if fresh_reasoning_effort:
                     SESSION_STORE.set_reasoning_effort(thread_key, fresh_reasoning_effort, owner_user_id=user_id)
 
+                if force_fresh:
+                    SESSION_STORE.clear_pending_subagent_target(thread_key)
+
                 existing_session_id = None if force_fresh else current_session_id
                 use_runtime_control = existing_session_id is None or current_session_mode == SESSION_MODE_CONTROL
                 if existing_session_id and current_session_mode != SESSION_MODE_CONTROL:
@@ -4472,6 +5015,158 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         text=get_observe_mode_error(user_id, existing_session_id),
                     )
                     return
+
+                pending_subagent_target = None
+                if not force_fresh:
+                    pending_subagent_target = SESSION_STORE.get_pending_subagent_target(
+                        thread_key,
+                        current_session_id=current_session_id,
+                        owner_user_id=user_id,
+                    )
+
+                if pending_subagent_target:
+                    subagent_thread_id = pending_subagent_target.get("thread_id")
+                    subagent_info = None
+                    subagent_error = None
+                    try:
+                        subagent_info = find_subagent_for_main_session(current_session_id, subagent_thread_id)
+                    except Exception as exc:
+                        subagent_error = str(exc)
+                    if not subagent_info:
+                        SESSION_STORE.clear_pending_subagent_target(thread_key)
+                        error_text = (
+                            f"<@{user_id}> 已取消这次 subagent 单次路由：目标 `{subagent_thread_id}`"
+                            " 已不可用、不可读，或不再属于当前主 session。"
+                        )
+                        if subagent_error:
+                            error_text = f"{error_text}\n\n{subagent_error}"
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=error_text,
+                        )
+                    else:
+                        client.chat_postMessage(
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            text=(
+                                f"<@{user_id}> 正在把这条消息发给 "
+                                f"`{format_subagent_short_name(subagent_info.get('agent_nickname'), subagent_info.get('agent_role'), subagent_thread_id)}`，"
+                                "发送后会自动恢复 `main`。"
+                            ),
+                        )
+                        subagent_session_cwd = None
+                        with suppress(Exception):
+                            subagent_session_cwd = read_thread_cwd(subagent_thread_id)
+                        subagent_workdir = subagent_session_cwd or resolve_workdir(thread_key)
+                        subagent_reasoning_effort, _subagent_effort_source = resolve_reasoning_effort(
+                            thread_key,
+                            session_id=subagent_thread_id,
+                            session_origin=SESSION_ORIGIN_ATTACHED,
+                        )
+                        thread_collaboration_mode = resolve_collaboration_mode(thread_key)
+                        progress_updates_enabled, _progress_updates_source = resolve_progress_updates(thread_key)
+                        image_paths = []
+                        image_download_dir = None
+                        downloaded_documents = []
+                        document_download_dir = None
+                        if image_download_specs:
+                            image_download_dir = tempfile.mkdtemp(prefix="codex-slack-images-")
+                            try:
+                                image_paths = slack_image_inputs.download_slack_image_files(
+                                    image_download_specs,
+                                    ENV.get("SLACK_BOT_TOKEN", ""),
+                                    download_dir=image_download_dir,
+                                )
+                            except Exception as exc:
+                                slack_image_inputs.cleanup_download_directory(image_download_dir)
+                                SESSION_STORE.clear_pending_subagent_target(thread_key)
+                                client.chat_postMessage(
+                                    channel=channel,
+                                    thread_ts=thread_ts,
+                                    text=(
+                                        f"<@{user_id}> 下载 Slack 图片失败，暂时无法把这条图片消息发给 "
+                                        f"`{format_subagent_short_name(subagent_info.get('agent_nickname'), subagent_info.get('agent_role'), subagent_thread_id)}`。\n\n{exc}"
+                                    ),
+                                )
+                                return
+                        if document_download_specs:
+                            document_download_dir = tempfile.mkdtemp(prefix="codex-slack-documents-")
+                            try:
+                                downloaded_documents = slack_document_inputs.download_slack_document_files(
+                                    document_download_specs,
+                                    ENV.get("SLACK_BOT_TOKEN", ""),
+                                    download_dir=document_download_dir,
+                                )
+                            except Exception as exc:
+                                slack_document_inputs.cleanup_download_directory(document_download_dir)
+                                slack_image_inputs.cleanup_downloaded_files(image_paths)
+                                slack_image_inputs.cleanup_download_directory(image_download_dir)
+                                SESSION_STORE.clear_pending_subagent_target(thread_key)
+                                client.chat_postMessage(
+                                    channel=channel,
+                                    thread_ts=thread_ts,
+                                    text=(
+                                        f"<@{user_id}> 下载 Slack 文档失败，暂时无法把这条文档消息发给 "
+                                        f"`{format_subagent_short_name(subagent_info.get('agent_nickname'), subagent_info.get('agent_role'), subagent_thread_id)}`。\n\n{exc}"
+                                    ),
+                                )
+                                return
+                        routed_prompt = build_document_attachment_prompt(effective_prompt, downloaded_documents)
+                        routed_result = None
+                        try:
+                            with session_execution_guard(subagent_thread_id):
+                                routed_result = run_runtime_turn_with_updates(
+                                    client,
+                                    channel,
+                                    thread_ts,
+                                    thread_key,
+                                    routed_prompt,
+                                    session_id=subagent_thread_id,
+                                    enable_progress=progress_updates_enabled,
+                                    reasoning_effort=subagent_reasoning_effort,
+                                    workdir_override=subagent_workdir,
+                                    image_paths=image_paths,
+                                    owner_user_id=user_id,
+                                    session_origin=SESSION_ORIGIN_ATTACHED,
+                                    collaboration_mode=thread_collaboration_mode,
+                                    track_active_turn=False,
+                                    persist_session_binding=False,
+                                )
+                        finally:
+                            SESSION_STORE.clear_pending_subagent_target(thread_key)
+                            slack_document_inputs.cleanup_downloaded_documents(downloaded_documents)
+                            slack_document_inputs.cleanup_download_directory(document_download_dir)
+                            slack_image_inputs.cleanup_downloaded_files(image_paths)
+                            slack_image_inputs.cleanup_download_directory(image_download_dir)
+                        routed_text = maybe_prefix_thread_output(subagent_thread_id, routed_result.text)
+                        routed_text = (
+                            f"{routed_text}\n\n"
+                            f"已发送给 `{format_subagent_short_name(subagent_info.get('agent_nickname'), subagent_info.get('agent_role'), subagent_thread_id)}`；"
+                            "当前目标已恢复为 `main`。"
+                        )
+                        log_session_event(
+                            "subagent_send_next",
+                            thread_key,
+                            existing_session_id=current_session_id,
+                            next_session_id=current_session_id,
+                        )
+                        post_chunks(client, channel, thread_ts, routed_text)
+                        if response_contains_proposed_plan(routed_result.text):
+                            persist_latest_proposed_plan(
+                                thread_key,
+                                routed_result.text,
+                                session_id=current_session_id,
+                                owner_user_id=user_id,
+                            )
+                            post_thread_plan_actions_message(
+                                client,
+                                channel,
+                                thread_ts,
+                                thread_key,
+                                session_id=current_session_id,
+                            )
+                        return
 
                 log_session_event(
                     "fresh_attempt" if force_fresh else ("resume_attempt" if existing_session_id else "new_attempt"),
@@ -4665,7 +5360,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     existing_session_id=existing_session_id,
                     next_session_id=next_session_id,
                 )
-                post_chunks(client, channel, thread_ts, result)
+                post_chunks(client, channel, thread_ts, maybe_prefix_thread_output(next_session_id, result))
                 if response_contains_proposed_plan(result):
                     persist_latest_proposed_plan(
                         thread_key,
@@ -4840,6 +5535,20 @@ def get_home_bindings_rows(user_id, limit=5):
     for row in raw_rows:
         fallback_label = get_home_binding_label(row.get("thread_key", ""))
         title = get_thread_display_title(row.get("session_id", ""))
+        pending_target = SESSION_STORE.get_pending_subagent_target(
+            row.get("thread_key", ""),
+            current_session_id=row.get("session_id", ""),
+            owner_user_id=user_id,
+        )
+        status_text = fallback_label if title and title != fallback_label else None
+        if pending_target:
+            pending_label = format_subagent_short_name(
+                pending_target.get("agent_nickname"),
+                pending_target.get("agent_role"),
+                pending_target.get("thread_id"),
+            )
+            pending_text = f"pending next target: {pending_label}"
+            status_text = f"{status_text} | {pending_text}" if status_text else pending_text
         rows.append(
             {
                 "label": title or fallback_label,
@@ -4847,7 +5556,7 @@ def get_home_bindings_rows(user_id, limit=5):
                 "mode": row.get("mode", "-"),
                 "cwd": row.get("cwd", "-"),
                 "updated_at": format_home_timestamp(row.get("updated_at")),
-                "status_text": fallback_label if title and title != fallback_label else None,
+                "status_text": status_text,
                 "action_id": "binding_rename_open",
                 "action_text": "Rename",
                 "action_value": encode_home_binding_value(
@@ -5048,6 +5757,199 @@ def build_app():
             )
         except Exception as exc:  # pragma: no cover
             logger.exception("Failed submitting binding rename for %s: %r", user_id, exc)
+
+    @app.action(SUBAGENT_SEND_NEXT_ACTION)
+    def handle_subagent_send_next(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected subagent_send_next from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            thread_key, session_id, subagent_thread_id = decode_subagent_action_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid subagent_send_next payload from %s: %r", user_id, exc)
+            return
+        if get_thread_owner_access_error(thread_key, user_id):
+            logger.warning("Rejected subagent_send_next for non-owner user %s thread %s", user_id, thread_key)
+            return
+        channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
+        if not channel_id or not thread_ts:
+            return
+        current_session_id = SESSION_STORE.get(thread_key)
+        current_mode = get_session_mode(thread_key)
+        if current_session_id != session_id:
+            SESSION_STORE.clear_pending_subagent_target(thread_key)
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
+            )
+            return
+        if current_mode != SESSION_MODE_CONTROL:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=f"<@{user_id}> 当前 Slack thread 处于 `observe` 模式。请先发送 `control` 或 `takeover`，再选择 `Send next message`。",
+            )
+            return
+        try:
+            subagent = find_subagent_for_main_session(session_id, subagent_thread_id)
+        except Exception as exc:
+            subagent = None
+            logger.exception("Failed discovering subagent %s for %s: %r", subagent_thread_id, session_id, exc)
+        if not subagent:
+            SESSION_STORE.clear_pending_subagent_target(thread_key)
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="这个 subagent 已不可用、不可读，或不再属于当前主 session。请重新发送 `subagents`。",
+            )
+            return
+        previous_target = SESSION_STORE.get_pending_subagent_target(
+            thread_key,
+            current_session_id=session_id,
+            owner_user_id=user_id,
+        )
+        pending_target = SESSION_STORE.set_pending_subagent_target(
+            thread_key,
+            thread_id=subagent_thread_id,
+            agent_nickname=subagent.get("agent_nickname"),
+            agent_role=subagent.get("agent_role"),
+            owner_user_id=user_id,
+            session_id=session_id,
+        )
+        label = format_subagent_short_name(
+            subagent.get("agent_nickname"),
+            subagent.get("agent_role"),
+            subagent_thread_id,
+        )
+        if previous_target and previous_target.get("thread_id") != subagent_thread_id:
+            text = f"下一条普通消息目标已更新为 `{label}`。发送后会自动恢复 `main`。"
+        else:
+            text = f"下一条普通消息将发给 `{label}`，发送后会自动恢复 `main`。"
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=text,
+            blocks=build_subagent_send_cancel_blocks(thread_key, session_id),
+        )
+
+    @app.action(SUBAGENT_SEND_CANCEL_ACTION)
+    def handle_subagent_send_cancel(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected subagent_send_cancel from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            thread_key, _session_id, _subagent_thread_id = decode_subagent_action_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid subagent_send_cancel payload from %s: %r", user_id, exc)
+            return
+        if get_thread_owner_access_error(thread_key, user_id):
+            logger.warning("Rejected subagent_send_cancel for non-owner user %s thread %s", user_id, thread_key)
+            return
+        channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
+        if not channel_id or not thread_ts:
+            return
+        SESSION_STORE.clear_pending_subagent_target(thread_key)
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text="已取消这次 subagent 单次路由；当前目标仍是 `main`。",
+        )
+
+    @app.action(SUBAGENT_OBSERVE_ACTION)
+    def handle_subagent_observe(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected subagent_observe from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            thread_key, session_id, subagent_thread_id = decode_subagent_action_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid subagent_observe payload from %s: %r", user_id, exc)
+            return
+        if get_thread_owner_access_error(thread_key, user_id):
+            logger.warning("Rejected subagent_observe for non-owner user %s thread %s", user_id, thread_key)
+            return
+        channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
+        if not channel_id or not thread_ts:
+            return
+        if SESSION_STORE.get(thread_key) != session_id:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
+            )
+            return
+        attach_thread_to_session(
+            client,
+            channel_id,
+            thread_ts,
+            thread_key,
+            session_id=subagent_thread_id,
+            user_id=user_id,
+            mode=SESSION_MODE_OBSERVE,
+            include_bootstrap=True,
+        )
+
+    @app.action(SUBAGENT_ATTACH_ACTION)
+    def handle_subagent_attach(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected subagent_attach from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            thread_key, session_id, subagent_thread_id = decode_subagent_action_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid subagent_attach payload from %s: %r", user_id, exc)
+            return
+        if get_thread_owner_access_error(thread_key, user_id):
+            logger.warning("Rejected subagent_attach for non-owner user %s thread %s", user_id, thread_key)
+            return
+        channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
+        if not channel_id or not thread_ts:
+            return
+        if SESSION_STORE.get(thread_key) != session_id:
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text="当前主 session 已变化，之前看到的 subagent 列表已过期。请重新发送 `subagents`。",
+            )
+            return
+        attach_thread_to_session(
+            client,
+            channel_id,
+            thread_ts,
+            thread_key,
+            session_id=subagent_thread_id,
+            user_id=user_id,
+            mode=SESSION_MODE_OBSERVE,
+        )
 
     @app.action(THREAD_COLLABORATION_MODE_PLAN_ACTION)
     @app.action(THREAD_COLLABORATION_MODE_DEFAULT_ACTION)

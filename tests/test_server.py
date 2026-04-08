@@ -87,6 +87,7 @@ class CommandParsingTests(unittest.TestCase):
         self.assertEqual(server.strip_progress_command("/progress reset"), "reset")
         self.assertTrue(server.is_status_command("whoami"))
         self.assertTrue(server.is_mode_command("mode"))
+        self.assertTrue(server.is_subagents_command("subagents"))
         self.assertTrue(server.is_session_command("session id"))
         self.assertTrue(server.is_watch_command("/watch"))
         self.assertFalse(server.is_watch_command("watch raw"))
@@ -402,6 +403,39 @@ class SessionStoreTests(unittest.TestCase):
             self.assertIsNone(previous_session_id)
             self.assertIn("不允许跨用户接管", error)
             self.assertIsNone(store.get("C2:2"))
+
+    def test_pending_subagent_target_persists_and_reload_validates_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.json"
+            store = server.SlackThreadSessionStore(path)
+            session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
+            store.set("C1:1", session_id, owner_user_id="U111")
+            store.set_pending_subagent_target(
+                "C1:1",
+                thread_id="sub-1",
+                agent_nickname="Atlas",
+                agent_role="explorer",
+                owner_user_id="U111",
+                session_id=session_id,
+                armed_at=int(time.time()),
+            )
+
+            reloaded = server.SlackThreadSessionStore(path)
+
+        pending = reloaded.get_pending_subagent_target(
+            "C1:1",
+            current_session_id=session_id,
+            owner_user_id="U111",
+        )
+        self.assertEqual(pending["thread_id"], "sub-1")
+        self.assertEqual(pending["agent_nickname"], "Atlas")
+        self.assertIsNone(
+            reloaded.get_pending_subagent_target(
+                "C1:1",
+                current_session_id="different-session",
+                owner_user_id="U111",
+            )
+        )
 
     def test_thread_owner_access_error_rejects_non_owner(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1618,6 +1652,22 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertEqual(rows[0]["label"], "Channel Thread")
         self.assertIsNone(rows[0]["status_text"])
 
+    def test_get_home_bindings_rows_includes_pending_subagent_summary(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id, session_cwd="/tmp/project")
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+
+        with patch.object(server, "read_thread_response", return_value={"thread": {"name": "mobile handoff"}}):
+            rows = server.get_home_bindings_rows(self.user_id, limit=5)
+
+        self.assertIn("pending next target: Atlas (explorer)", rows[0]["status_text"])
+
     def test_build_home_rename_modal_encodes_binding_metadata(self):
         modal = server.build_home_rename_modal(
             thread_key=self.thread_key,
@@ -1664,6 +1714,159 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertIn("- effective_reasoning_effort: `high (thread)`", text)
         self.assertEqual(len(self.client.messages), 1)
 
+    def test_status_reports_pending_subagent_target(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+            armed_at=int(time.time()),
+        )
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "status", self.user_id)
+
+        text = self.client.messages[0]["text"]
+        self.assertIn("pending_subagent_target", text)
+        self.assertIn("Atlas (explorer)", text)
+
+    def test_subagents_command_without_session_returns_hint(self):
+        server.process_prompt(self.client, self.channel, self.thread_ts, "subagents", self.user_id)
+        self.assertIn("还没有绑定 session", self.client.messages[0]["text"])
+
+    def test_subagents_command_posts_blocks_in_observe_mode(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
+        subagents = [
+            {
+                "thread_id": "sub-1",
+                "agent_nickname": "Atlas",
+                "agent_role": "explorer",
+                "status": "idle",
+                "updated_at": int(time.time()),
+            }
+        ]
+
+        with patch.object(server, "discover_subagents", return_value=subagents):
+            server.process_prompt(self.client, self.channel, self.thread_ts, "subagents", self.user_id)
+
+        self.assertEqual(self.client.messages[0]["blocks"][0]["text"]["text"].splitlines()[0], "*Subagents*")
+        self.assertIn("observe", self.client.messages[0]["blocks"][0]["text"]["text"])
+
+    def test_pending_subagent_route_sends_one_message_and_clears_state(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+        result = server.CodexRunResult(
+            session_id="sub-1",
+            text="subagent done",
+            exit_code=0,
+            raw_output="",
+            final_output="subagent done",
+            json_output="",
+            cleaned_output="subagent done",
+            timed_out=False,
+        )
+
+        with patch.object(
+            server,
+            "find_subagent_for_main_session",
+            return_value={
+                "thread_id": "sub-1",
+                "agent_nickname": "Atlas",
+                "agent_role": "explorer",
+                "status": "idle",
+                "updated_at": int(time.time()),
+            },
+        ):
+            with patch.object(server, "read_thread_cwd", return_value="/tmp/subagent"):
+                with patch.object(server, "run_runtime_turn_with_updates", return_value=result) as run_runtime_turn:
+                    with patch.object(
+                        server,
+                        "maybe_prefix_thread_output",
+                        side_effect=lambda _sid, text, **_kwargs: f"Atlas · explorer\n\n{text}",
+                    ):
+                        server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
+
+        self.assertEqual(run_runtime_turn.call_args.kwargs["session_id"], "sub-1")
+        self.assertFalse(run_runtime_turn.call_args.kwargs["track_active_turn"])
+        self.assertFalse(run_runtime_turn.call_args.kwargs["persist_session_binding"])
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+        self.assertIn("当前目标已恢复为 `main`", self.client.messages[-1]["text"])
+        self.assertEqual(self.store.get(self.thread_key), self.session_id)
+
+    def test_status_command_does_not_consume_pending_subagent_target(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-1",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "status", self.user_id)
+
+        self.assertIsNotNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+
+    def test_invalid_pending_subagent_target_falls_back_to_main_session(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        self.store.set_pending_subagent_target(
+            self.thread_key,
+            thread_id="sub-404",
+            agent_nickname="Atlas",
+            agent_role="explorer",
+            owner_user_id=self.user_id,
+            session_id=self.session_id,
+        )
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="main done",
+            exit_code=0,
+            raw_output="",
+            final_output="main done",
+            json_output="",
+            cleaned_output="main done",
+            timed_out=False,
+        )
+
+        with patch.object(server, "find_subagent_for_main_session", return_value=None):
+            with patch.object(server, "run_runtime_turn_with_updates", return_value=result) as run_runtime_turn:
+                server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
+
+        self.assertEqual(run_runtime_turn.call_args.kwargs["session_id"], self.session_id)
+        self.assertIn("已取消这次 subagent 单次路由", self.client.messages[0]["text"])
+        self.assertIsNone(
+            self.store.get_pending_subagent_target(
+                self.thread_key,
+                current_session_id=self.session_id,
+                owner_user_id=self.user_id,
+            )
+        )
+
     def test_mode_command_posts_collaboration_mode_card(self):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
 
@@ -1695,7 +1898,7 @@ class ProcessPromptTests(unittest.TestCase):
 
         self.assertEqual(len(self.client.messages), 3)
         self.assertIn("<proposed_plan>", self.client.messages[1]["text"])
-        self.assertIn("*Collaboration Mode*", self.client.messages[2]["blocks"][0]["text"]["text"])
+        self.assertIn("*Approved Plan*", self.client.messages[2]["blocks"][0]["text"]["text"])
 
     def test_effort_command_sets_thread_override(self):
         self.store.set(
