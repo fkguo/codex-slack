@@ -437,6 +437,7 @@ class AppServerRuntime:
     @staticmethod
     def _extract_final_text_from_session(session):
         last_unknown_phase_text = ""
+        last_completed_agent_message_text = ""
         last_plan_text = ""
 
         for event in reversed(session.raw_events):
@@ -460,15 +461,77 @@ class AppServerRuntime:
                 continue
             if not text:
                 continue
+            if not last_completed_agent_message_text:
+                last_completed_agent_message_text = text
             phase = item.get("phase")
             if phase == "final_answer":
                 return text
             if phase is None and not last_unknown_phase_text:
                 last_unknown_phase_text = text
 
+        if last_completed_agent_message_text:
+            return last_completed_agent_message_text
         if last_plan_text:
             return f"<proposed_plan>\n{last_plan_text.rstrip()}\n</proposed_plan>"
         return last_unknown_phase_text
+
+    async def _read_turn_agent_message_async(
+        self,
+        client,
+        *,
+        thread_id,
+        turn_id,
+    ):
+        try:
+            response = await client.read_thread(thread_id, include_turns=True)
+        except Exception:
+            return None
+
+        if not isinstance(response, Mapping):
+            return None
+        thread = response.get("thread")
+        if not isinstance(thread, Mapping):
+            return None
+        turns = thread.get("turns")
+        if not isinstance(turns, list):
+            return None
+
+        target_turn = None
+        for turn in turns:
+            if isinstance(turn, Mapping) and turn.get("id") == turn_id:
+                target_turn = turn
+                break
+        if target_turn is None and turns:
+            last_turn = turns[-1]
+            if isinstance(last_turn, Mapping):
+                target_turn = last_turn
+        if not isinstance(target_turn, Mapping):
+            return None
+
+        items = target_turn.get("items")
+        if not isinstance(items, list):
+            return None
+
+        final_message = None
+        final_plan = None
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            item_type = item.get("type")
+            if item_type == "agentMessage":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    final_message = text
+            elif item_type == "plan":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    final_plan = text
+
+        if final_message:
+            return final_message
+        if final_plan:
+            return f"<proposed_plan>\n{final_plan.rstrip()}\n</proposed_plan>"
+        return None
 
     async def _resolve_thread_async(self, session_id, thread_config):
         if session_id:
@@ -629,6 +692,12 @@ class AppServerRuntime:
                         on_step(record.step)
 
             final_text = self._extract_final_text_from_session(session)
+            if not final_text:
+                final_text = await self._read_turn_agent_message_async(
+                    client,
+                    thread_id=active_thread_id,
+                    turn_id=turn_id,
+                )
             if interrupted and not final_text:
                 final_text = "当前 turn 已被中断。"
 

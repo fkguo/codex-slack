@@ -17,6 +17,7 @@
 - `attach` 后默认进入 `observe` 模式，避免和终端里的交互式 Codex 并发写入
 - 只有切到 `control` / `takeover` 模式后，Slack 普通消息才会继续 `resume` 当前 session
 - 当前 Slack thread 可通过 `mode` 命令显示按钮，切换后续 Slack 接管 turn 的 collaboration mode：`Plan` / `Default`
+- 如果某一轮回复里包含完整的 `<proposed_plan>...</proposed_plan>`，结果发完后会自动附带 `Implement clean` / `Implement here` / `Keep planning` 按钮
 - 支持把 Slack 消息里的图片附件和文档类附件传给 Codex
 - `watch` 会先回放最近一轮已完成的可显示对话，然后在 thread 对话发生变化时持续推送后续新增的用户消息和 `final_answer`
 - `name <title>` 可重命名当前 session
@@ -84,6 +85,10 @@ CODEX_PROGRESS_BATCH_SECONDS=5
 
 - `ALLOWED_SLACK_USER_IDS` 留空表示不限制；如果填写，则只有这些 Slack `user_id` 可以使用 bot
 - 多个 `user_id` 用英文逗号分隔
+- `ALLOWED_SLACK_USER_IDS` 填的是 Slack 成员自己的 `user_id`，不是 bot 的 id
+- 获取自己的 `user_id`：
+  - 桌面版或网页版：打开自己的个人资料，点击右上角 `...`，选择 `Copy member ID`
+  - 手机端：打开自己的个人资料，进入更多选项后选择 `Copy member ID`
 - `ALLOW_SHARED_ATTACH=0` 是更安全的默认值
 - 单用户白名单模式下，允许直接 `attach` 一个尚未被 bot 见过的 session
 - 多用户共享 `attach` 需要显式设置 `ALLOW_SHARED_ATTACH=1`
@@ -203,6 +208,7 @@ python3 server.py
 - `effort reset`：清除当前 Slack thread 的 effort override
 - `where` / `whoami` / `status`：查看当前 thread 的绑定状态
 - `mode`：显示当前 Slack thread 的 `Collaboration Mode` 卡片，可直接点 `Plan` / `Default`
+- `<proposed_plan>` 回复之后的按钮：`Implement clean` / `Implement here` / `Keep planning`
 - `watch`：显示最近一轮对话，并持续推送后续新增对话
 - `unwatch` / `stop watch`：停止持续 watch
 - `control` / `takeover`：切到 `control` 模式，允许 Slack 普通消息继续 `resume`；如果当前 thread 上有 `watch`，会自动停止以避免重复消息
@@ -239,7 +245,10 @@ python3 server.py
 - 这个设置作用于“后续由 Slack 接管后启动的 turn”
 - `Default` 适合直接推进任务；`Plan` 更适合先整理步骤、方案和风险，再继续执行
 - 发送 `mode` 可在当前 thread 里重新显示 `Plan` / `Default` 按钮卡片
-- 如果某一轮回复里包含完整的 `<proposed_plan>...</proposed_plan>`，结果发完后会自动附带这个按钮卡片，方便你继续切换模式
+- 如果某一轮回复里包含完整的 `<proposed_plan>...</proposed_plan>`，结果发完后会自动附带计划执行按钮：
+  - `Implement clean`：新建一个 implementation session，再按这份 plan 开始执行
+  - `Implement here`：留在当前 session，直接按这份 plan 继续执行
+  - `Keep planning`：继续保留 `Plan` 模式，后续继续细化方案
 - 如果当前只是 `watch` 终端里已经在运行的一轮，切换 `Plan` / `Default` 不会改写那一轮；它会在下一轮由 Slack 接管后生效
 
 ## `request_user_input`
@@ -335,9 +344,8 @@ watch
 
 获取方式：
 
-- 在 Slack 桌面版或网页版打开你的个人资料
-- 右上角 `...`
-- 选择 `Copy member ID`
+- 桌面版或网页版：打开你的个人资料，右上角 `...` -> `Copy member ID`
+- 手机端：打开你的个人资料，在更多选项里选择 `Copy member ID`
 
 ## Session 模型
 

@@ -94,6 +94,10 @@ SUPPORTED_COLLABORATION_MODES = (COLLABORATION_MODE_DEFAULT, COLLABORATION_MODE_
 THREAD_COLLABORATION_MODE_ACTION = "thread_collaboration_mode_set"
 THREAD_COLLABORATION_MODE_PLAN_ACTION = f"{THREAD_COLLABORATION_MODE_ACTION}_plan"
 THREAD_COLLABORATION_MODE_DEFAULT_ACTION = f"{THREAD_COLLABORATION_MODE_ACTION}_default"
+THREAD_PLAN_ACTION = "thread_plan_execute"
+THREAD_PLAN_IMPLEMENT_CLEAN_ACTION = f"{THREAD_PLAN_ACTION}_clean"
+THREAD_PLAN_IMPLEMENT_HERE_ACTION = f"{THREAD_PLAN_ACTION}_here"
+THREAD_PLAN_KEEP_PLANNING_ACTION = f"{THREAD_PLAN_ACTION}_keep_planning"
 REQUEST_USER_INPUT_OPEN_ACTION = "request_user_input_open"
 REQUEST_USER_INPUT_CANCEL_ACTION = "request_user_input_cancel"
 REQUEST_USER_INPUT_SUBMIT_CALLBACK = "request_user_input_submit"
@@ -162,6 +166,25 @@ def normalize_session_cwd(value):
     return normalized or None
 
 
+def normalize_plan_text(value):
+    text = str(value or "").strip()
+    return text or None
+
+
+def normalize_plan_execution_mode(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in {"clean", "here"}:
+        return normalized
+    return None
+
+
+def sanitize_inline_code_text(value, max_length=120):
+    text = " ".join(str(value or "").split()).replace("`", "'").strip()
+    if len(text) <= max_length:
+        return text or "-"
+    return text[: max_length - 3].rstrip() + "..."
+
+
 class SlackThreadSessionStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -211,6 +234,25 @@ class SlackThreadSessionStore:
             collaboration_mode = normalize_collaboration_mode(value.get("collaboration_mode"))
             if collaboration_mode:
                 entry["collaboration_mode"] = collaboration_mode
+            latest_plan_text = normalize_plan_text(value.get("latest_plan_text"))
+            if latest_plan_text:
+                entry["latest_plan_text"] = latest_plan_text
+            latest_plan_session_id = str(value.get("latest_plan_session_id") or "").strip()
+            if latest_plan_session_id:
+                entry["latest_plan_session_id"] = latest_plan_session_id
+            latest_plan_approved_at = value.get("latest_plan_approved_at")
+            if isinstance(latest_plan_approved_at, int) and latest_plan_approved_at > 0:
+                entry["latest_plan_approved_at"] = latest_plan_approved_at
+            latest_plan_execution_mode = normalize_plan_execution_mode(
+                value.get("latest_plan_execution_mode")
+            )
+            if latest_plan_execution_mode:
+                entry["latest_plan_execution_mode"] = latest_plan_execution_mode
+            latest_plan_execution_session_id = str(
+                value.get("latest_plan_execution_session_id") or ""
+            ).strip()
+            if latest_plan_execution_session_id:
+                entry["latest_plan_execution_session_id"] = latest_plan_execution_session_id
             if not self._has_persisted_state(entry):
                 continue
             normalized[key] = entry
@@ -227,6 +269,7 @@ class SlackThreadSessionStore:
                 bool(entry.get("reasoning_effort")),
                 "progress_updates" in entry,
                 bool(entry.get("collaboration_mode")),
+                bool(entry.get("latest_plan_text")),
             ]
         )
 
@@ -311,6 +354,46 @@ class SlackThreadSessionStore:
                 return None
             return normalize_collaboration_mode(entry.get("collaboration_mode"))
 
+    def get_latest_plan(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return normalize_plan_text(entry.get("latest_plan_text"))
+
+    def get_latest_plan_session_id(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            value = str(entry.get("latest_plan_session_id") or "").strip()
+            return value or None
+
+    def get_latest_plan_approved_at(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            value = entry.get("latest_plan_approved_at")
+            if isinstance(value, int) and value > 0:
+                return value
+            return None
+
+    def get_latest_plan_execution_mode(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return normalize_plan_execution_mode(entry.get("latest_plan_execution_mode"))
+
+    def get_latest_plan_execution_session_id(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            value = str(entry.get("latest_plan_execution_session_id") or "").strip()
+            return value or None
+
     def find_owner_for_session(self, session_id):
         with self._lock:
             for entry in self._sessions.values():
@@ -341,6 +424,25 @@ class SlackThreadSessionStore:
             collaboration_mode = normalize_collaboration_mode(existing_entry.get("collaboration_mode"))
             if collaboration_mode:
                 entry["collaboration_mode"] = collaboration_mode
+            latest_plan_text = normalize_plan_text(existing_entry.get("latest_plan_text"))
+            if latest_plan_text:
+                entry["latest_plan_text"] = latest_plan_text
+            latest_plan_session_id = str(existing_entry.get("latest_plan_session_id") or "").strip()
+            if latest_plan_session_id:
+                entry["latest_plan_session_id"] = latest_plan_session_id
+            latest_plan_approved_at = existing_entry.get("latest_plan_approved_at")
+            if isinstance(latest_plan_approved_at, int) and latest_plan_approved_at > 0:
+                entry["latest_plan_approved_at"] = latest_plan_approved_at
+            latest_plan_execution_mode = normalize_plan_execution_mode(
+                existing_entry.get("latest_plan_execution_mode")
+            )
+            if latest_plan_execution_mode:
+                entry["latest_plan_execution_mode"] = latest_plan_execution_mode
+            latest_plan_execution_session_id = str(
+                existing_entry.get("latest_plan_execution_session_id") or ""
+            ).strip()
+            if latest_plan_execution_session_id:
+                entry["latest_plan_execution_session_id"] = latest_plan_execution_session_id
             effective_session_origin = session_origin or existing_entry.get("session_origin") or SESSION_ORIGIN_SLACK
             if effective_session_origin in {SESSION_ORIGIN_ATTACHED, SESSION_ORIGIN_SLACK}:
                 entry["session_origin"] = effective_session_origin
@@ -401,6 +503,25 @@ class SlackThreadSessionStore:
             collaboration_mode = normalize_collaboration_mode(existing_entry.get("collaboration_mode"))
             if collaboration_mode:
                 entry["collaboration_mode"] = collaboration_mode
+            latest_plan_text = normalize_plan_text(existing_entry.get("latest_plan_text"))
+            if latest_plan_text:
+                entry["latest_plan_text"] = latest_plan_text
+            latest_plan_session_id = str(existing_entry.get("latest_plan_session_id") or "").strip()
+            if latest_plan_session_id:
+                entry["latest_plan_session_id"] = latest_plan_session_id
+            latest_plan_approved_at = existing_entry.get("latest_plan_approved_at")
+            if isinstance(latest_plan_approved_at, int) and latest_plan_approved_at > 0:
+                entry["latest_plan_approved_at"] = latest_plan_approved_at
+            latest_plan_execution_mode = normalize_plan_execution_mode(
+                existing_entry.get("latest_plan_execution_mode")
+            )
+            if latest_plan_execution_mode:
+                entry["latest_plan_execution_mode"] = latest_plan_execution_mode
+            latest_plan_execution_session_id = str(
+                existing_entry.get("latest_plan_execution_session_id") or ""
+            ).strip()
+            if latest_plan_execution_session_id:
+                entry["latest_plan_execution_session_id"] = latest_plan_execution_session_id
             effective_session_cwd = normalize_session_cwd(session_cwd) or normalize_session_cwd(
                 existing_entry.get("session_cwd")
             )
@@ -491,6 +612,47 @@ class SlackThreadSessionStore:
         with self._lock:
             existing_entry = dict(self._sessions.get(key, {}))
             existing_entry["session_cwd"] = normalized_cwd
+            existing_entry["updated_at"] = int(time.time())
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
+            if effective_owner_user_id:
+                existing_entry["owner_user_id"] = effective_owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
+
+    def set_latest_plan(self, key, plan_text, session_id=None, owner_user_id=None):
+        normalized_plan_text = normalize_plan_text(plan_text)
+        if not normalized_plan_text:
+            return
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["latest_plan_text"] = normalized_plan_text
+            normalized_session_id = str(session_id or "").strip()
+            if normalized_session_id:
+                existing_entry["latest_plan_session_id"] = normalized_session_id
+            existing_entry["updated_at"] = int(time.time())
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
+            if effective_owner_user_id:
+                existing_entry["owner_user_id"] = effective_owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
+
+    def mark_plan_implemented(
+        self,
+        key,
+        *,
+        execution_mode,
+        execution_session_id,
+        owner_user_id=None,
+    ):
+        normalized_mode = normalize_plan_execution_mode(execution_mode)
+        normalized_session_id = str(execution_session_id or "").strip()
+        if not normalized_mode or not normalized_session_id:
+            return
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["latest_plan_execution_mode"] = normalized_mode
+            existing_entry["latest_plan_execution_session_id"] = normalized_session_id
+            existing_entry["latest_plan_approved_at"] = int(time.time())
             existing_entry["updated_at"] = int(time.time())
             effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
             if effective_owner_user_id:
@@ -1067,6 +1229,48 @@ def response_contains_proposed_plan(text):
     return "<proposed_plan>" in normalized and "</proposed_plan>" in normalized
 
 
+def extract_latest_proposed_plan(text):
+    normalized = str(text or "")
+    matches = re.findall(
+        r"<proposed_plan>\s*(.*?)\s*</proposed_plan>",
+        normalized,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    if not matches:
+        return None
+    return normalize_plan_text(matches[-1])
+
+
+def format_relative_timestamp(timestamp):
+    if not isinstance(timestamp, int) or timestamp <= 0:
+        return "-"
+    delta = max(0, int(time.time()) - timestamp)
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        hours = delta // 3600
+        minutes = (delta % 3600) // 60
+        return f"{hours}h {minutes}m ago" if minutes else f"{hours}h ago"
+    days = delta // 86400
+    hours = (delta % 86400) // 3600
+    return f"{days}d {hours}h ago" if hours else f"{days}d ago"
+
+
+def persist_latest_proposed_plan(thread_key, result_text, session_id=None, owner_user_id=None):
+    plan_text = extract_latest_proposed_plan(result_text)
+    if not plan_text:
+        return None
+    SESSION_STORE.set_latest_plan(
+        thread_key,
+        plan_text,
+        session_id=session_id,
+        owner_user_id=owner_user_id,
+    )
+    return plan_text
+
+
 def get_watch_poll_seconds():
     raw = str(ENV.get("CODEX_SLACK_WATCH_POLL_SECONDS", DEFAULT_WATCH_POLL_SECONDS)).strip()
     try:
@@ -1254,6 +1458,22 @@ def get_collaboration_mode_state_lines(thread_key, session_store=None):
     return [
         f"- collaboration_mode_effective: `{effective_mode}`",
         f"- collaboration_mode_thread_override: `{thread_mode or '-'}`",
+    ]
+
+
+def get_plan_state_lines(thread_key, session_store=None):
+    session_store = session_store or SESSION_STORE
+    latest_plan_session_id = session_store.get_latest_plan_session_id(thread_key)
+    latest_plan_execution_mode = session_store.get_latest_plan_execution_mode(thread_key)
+    latest_plan_execution_session_id = session_store.get_latest_plan_execution_session_id(thread_key)
+    latest_plan_approved_at = session_store.get_latest_plan_approved_at(thread_key)
+    latest_plan_text = session_store.get_latest_plan(thread_key)
+    return [
+        f"- latest_plan_session_id: `{latest_plan_session_id or '-'}`",
+        f"- latest_plan_execution_mode: `{latest_plan_execution_mode or '-'}`",
+        f"- latest_plan_execution_session_id: `{latest_plan_execution_session_id or '-'}`",
+        f"- latest_plan_approved_at: `{format_relative_timestamp(latest_plan_approved_at)}`",
+        f"- latest_plan_preview: `{sanitize_inline_code_text(latest_plan_text or '-', max_length=100)}`",
     ]
 
 
@@ -1475,6 +1695,28 @@ def build_runtime_collaboration_mode_payload(collaboration_mode, reasoning_effor
     return payload
 
 
+def encode_thread_plan_action_value(thread_key, action_name):
+    return json.dumps(
+        {
+            "thread_key": str(thread_key or "").strip(),
+            "action": str(action_name or "").strip(),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def decode_thread_plan_action_value(raw_value):
+    payload = json.loads(str(raw_value or ""))
+    if not isinstance(payload, dict):
+        raise RuntimeError("plan action payload invalid")
+    thread_key = str(payload.get("thread_key") or "").strip()
+    action_name = str(payload.get("action") or "").strip()
+    if action_name not in {"clean", "here", "keep_planning"} or not thread_key:
+        raise RuntimeError("plan action payload incomplete")
+    return thread_key, action_name
+
+
 def encode_thread_collaboration_mode_value(thread_key, target_mode):
     return json.dumps(
         {
@@ -1554,6 +1796,131 @@ def post_thread_collaboration_mode_message(client, channel, thread_ts, thread_ke
         thread_ts=thread_ts,
         text=text,
         blocks=blocks,
+    )
+
+
+def build_thread_plan_actions_message(thread_key, session_id=None, footer_note=None):
+    latest_plan_text = SESSION_STORE.get_latest_plan(thread_key)
+    plan_session_id = SESSION_STORE.get_latest_plan_session_id(thread_key) or session_id or "-"
+    approved_at = SESSION_STORE.get_latest_plan_approved_at(thread_key)
+    execution_mode = SESSION_STORE.get_latest_plan_execution_mode(thread_key)
+    execution_session_id = SESSION_STORE.get_latest_plan_execution_session_id(thread_key)
+    current_mode = resolve_collaboration_mode(thread_key)
+    lines = [
+        "*Approved Plan*",
+        "选择下一步：直接继续规划，或开始按这份方案实施。",
+        f"Planning session: `{plan_session_id}`",
+        f"Current collaboration mode: `{format_collaboration_mode_label(current_mode)}`",
+    ]
+    if latest_plan_text:
+        lines.append(f"Plan preview: `{sanitize_inline_code_text(latest_plan_text, max_length=120)}`")
+    if execution_mode and execution_session_id:
+        lines.append(
+            "Last implementation: "
+            f"`{execution_mode}` -> `{execution_session_id}` ({format_relative_timestamp(approved_at)})"
+        )
+    if footer_note:
+        lines.append("")
+        lines.append(str(footer_note).strip())
+    text = "\n".join(lines)
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": text},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": THREAD_PLAN_IMPLEMENT_CLEAN_ACTION,
+                    "text": {"type": "plain_text", "text": "Implement clean"},
+                    "style": "primary",
+                    "value": encode_thread_plan_action_value(thread_key, "clean"),
+                },
+                {
+                    "type": "button",
+                    "action_id": THREAD_PLAN_IMPLEMENT_HERE_ACTION,
+                    "text": {"type": "plain_text", "text": "Implement here"},
+                    "value": encode_thread_plan_action_value(thread_key, "here"),
+                },
+                {
+                    "type": "button",
+                    "action_id": THREAD_PLAN_KEEP_PLANNING_ACTION,
+                    "text": {"type": "plain_text", "text": "Keep planning"},
+                    "value": encode_thread_plan_action_value(thread_key, "keep_planning"),
+                },
+            ],
+        },
+    ]
+    return text.replace("*", ""), blocks
+
+
+def post_thread_plan_actions_message(client, channel, thread_ts, thread_key, session_id=None, footer_note=None):
+    text, blocks = build_thread_plan_actions_message(
+        thread_key,
+        session_id=session_id,
+        footer_note=footer_note,
+    )
+    return client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=text,
+        blocks=blocks,
+    )
+
+
+def build_plan_runtime_summary(
+    thread_key,
+    *,
+    planning_session_id,
+    target_session_id,
+    execution_mode,
+    workdir,
+    reasoning_effort,
+    session_origin,
+):
+    lines = [
+        f"- slack_thread_key: `{thread_key}`",
+        f"- planning_session_id: `{planning_session_id or '-'}`",
+        f"- target_session_id: `{target_session_id or '-'}`",
+        f"- execution_mode: `{execution_mode}`",
+        f"- workdir: `{workdir}`",
+        f"- reasoning_effort: `{reasoning_effort or '-'}`",
+        f"- session_origin: `{session_origin or '-'}`",
+        f"- collaboration_mode_for_followup_turns: `{COLLABORATION_MODE_DEFAULT}`",
+    ]
+    return "\n".join(lines)
+
+
+def build_plan_implementation_prompt(
+    plan_text,
+    *,
+    thread_key,
+    planning_session_id,
+    target_session_id,
+    execution_mode,
+    workdir,
+    reasoning_effort,
+    session_origin,
+):
+    clean_note = (
+        "这是一个新的实现 session。不要假设你自动继承了之前 planning session 的完整上下文；"
+        "只依据下面提供的 plan 和运行摘要开始执行。"
+        if execution_mode == "clean"
+        else "继续在当前 session 中执行，但从现在开始应把下面的 plan 视为已批准的实施合同。"
+    )
+    return (
+        "请开始实施这份已经批准的方案。\n\n"
+        "要求：\n"
+        "- 默认直接开始执行，不要再重复规划\n"
+        "- 如遇到真正阻塞，再提出最小必要澄清\n"
+        "- 继续使用中文\n\n"
+        f"{clean_note}\n\n"
+        "Approved Plan:\n"
+        f"{plan_text}\n\n"
+        "Runtime Summary:\n"
+        f"{build_plan_runtime_summary(thread_key, planning_session_id=planning_session_id, target_session_id=target_session_id, execution_mode=execution_mode, workdir=workdir, reasoning_effort=reasoning_effort, session_origin=session_origin)}"
     )
 
 
@@ -2633,7 +3000,9 @@ def build_runtime_turn_unavailable_message(current_session_id):
     session_hint = f"session `{current_session_id}`" if current_session_id else "当前 session"
     return (
         f"{session_hint} 当前没有由 codex-slack runtime 持有的活跃 turn。"
-        " 终端里已经在运行的 turn 目前只能 `watch`；等它结束后，再发送普通消息让 Slack 接管后续 turn。"
+        " 这通常表示上一轮已经结束。"
+        " 如果你想继续，请直接发送普通消息开始下一轮；只有 turn 仍在运行时，`steer` / `interrupt` 才会生效。"
+        " 终端里已经在运行的 turn 目前只能 `watch`。"
     )
 
 
@@ -2743,12 +3112,13 @@ def run_runtime_turn_with_updates(
             progress_reporter.flush()
             progress_reporter.close()
 
+    effective_session_id = session_id_tracker.get() or runtime_result.session_id
     final_text = (runtime_result.final_text or "").strip() or build_empty_final_response_text(
-        session_id_tracker.get() or runtime_result.session_id
+        effective_session_id
     )
     raw_output = "\n\n".join(step.text for step in runtime_result.steps if step.text).strip()
     return CodexRunResult(
-        session_id=session_id_tracker.get() or runtime_result.session_id,
+        session_id=effective_session_id,
         text=final_text,
         exit_code=0,
         raw_output=raw_output,
@@ -2757,6 +3127,90 @@ def run_runtime_turn_with_updates(
         cleaned_output=final_text,
         timed_out=False,
     )
+
+
+def execute_plan_implementation_action(
+    client,
+    channel,
+    thread_ts,
+    thread_key,
+    *,
+    user_id,
+    execution_mode,
+):
+    current_session_id = SESSION_STORE.get(thread_key)
+    current_session_origin = get_session_origin(thread_key)
+    current_session_cwd = get_session_cwd(thread_key)
+    planning_session_id = SESSION_STORE.get_latest_plan_session_id(thread_key) or current_session_id
+    latest_plan_text = SESSION_STORE.get_latest_plan(thread_key)
+    if not latest_plan_text:
+        raise RuntimeError("当前 thread 还没有可实施的 `<proposed_plan>`。请先让 Codex 产出一份方案。")
+
+    run_workdir = resolve_workdir(
+        thread_key,
+        session_id=current_session_id,
+        session_cwd=current_session_cwd,
+    )
+    reasoning_effort, _effort_source = resolve_reasoning_effort(
+        thread_key,
+        session_id=current_session_id,
+        session_origin=current_session_origin,
+    )
+    SESSION_STORE.set_collaboration_mode(
+        thread_key,
+        COLLABORATION_MODE_DEFAULT,
+        owner_user_id=user_id,
+    )
+    SESSION_STORE.set_mode(thread_key, SESSION_MODE_CONTROL)
+    stop_watcher(thread_key)
+
+    target_session_id = current_session_id if execution_mode == "here" else None
+    prompt = build_plan_implementation_prompt(
+        latest_plan_text,
+        thread_key=thread_key,
+        planning_session_id=planning_session_id,
+        target_session_id=target_session_id,
+        execution_mode=execution_mode,
+        workdir=run_workdir,
+        reasoning_effort=reasoning_effort,
+        session_origin=current_session_origin or SESSION_ORIGIN_SLACK,
+    )
+    with session_execution_guard(target_session_id or planning_session_id):
+        codex_result = run_runtime_turn_with_updates(
+            client,
+            channel,
+            thread_ts,
+            thread_key,
+            prompt,
+            session_id=target_session_id,
+            enable_progress=resolve_progress_updates(thread_key)[0],
+            reasoning_effort=reasoning_effort,
+            workdir_override=run_workdir,
+            owner_user_id=user_id,
+            session_origin=SESSION_ORIGIN_SLACK,
+            collaboration_mode=COLLABORATION_MODE_DEFAULT,
+        )
+
+    next_session_id = codex_result.session_id
+    SESSION_STORE.set(
+        thread_key,
+        next_session_id,
+        owner_user_id=user_id,
+        session_origin=SESSION_ORIGIN_SLACK,
+        session_cwd=run_workdir,
+    )
+    SESSION_STORE.mark_plan_implemented(
+        thread_key,
+        execution_mode=execution_mode,
+        execution_session_id=next_session_id,
+        owner_user_id=user_id,
+    )
+    return codex_result, {
+        "planning_session_id": planning_session_id,
+        "next_session_id": next_session_id,
+        "workdir": run_workdir,
+        "reasoning_effort": reasoning_effort,
+    }
 
 
 def run_codex_with_updates(
@@ -3507,7 +3961,13 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     )
                     post_chunks(client, channel, thread_ts, result)
                     if response_contains_proposed_plan(result):
-                        post_thread_collaboration_mode_message(
+                        persist_latest_proposed_plan(
+                            thread_key,
+                            result,
+                            session_id=next_session_id or current_session_id,
+                            owner_user_id=user_id,
+                        )
+                        post_thread_plan_actions_message(
                             client,
                             channel,
                             thread_ts,
@@ -3597,7 +4057,13 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     )
                     post_chunks(client, channel, thread_ts, result)
                     if response_contains_proposed_plan(result):
-                        post_thread_collaboration_mode_message(
+                        persist_latest_proposed_plan(
+                            thread_key,
+                            result,
+                            session_id=next_session_id or current_session_id,
+                            owner_user_id=user_id,
+                        )
+                        post_thread_plan_actions_message(
                             client,
                             channel,
                             thread_ts,
@@ -3832,6 +4298,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     )
                     collaboration_lines = get_collaboration_mode_state_lines(thread_key)
                     progress_lines = get_progress_updates_state_lines(thread_key)
+                    plan_lines = get_plan_state_lines(thread_key)
                     client.chat_postMessage(
                         channel=channel,
                         thread_ts=thread_ts,
@@ -3855,6 +4322,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             + "\n".join(collaboration_lines)
                             + "\n"
                             + "\n".join(progress_lines)
+                            + "\n"
+                            + "\n".join(plan_lines)
                             + "\n"
                             "如果你想让终端继续同一个会话，可以在终端里使用这个 `session_id` 执行 `codex exec resume ...`。"
                         ),
@@ -4198,7 +4667,13 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                 )
                 post_chunks(client, channel, thread_ts, result)
                 if response_contains_proposed_plan(result):
-                    post_thread_collaboration_mode_message(
+                    persist_latest_proposed_plan(
+                        thread_key,
+                        result,
+                        session_id=next_session_id or existing_session_id,
+                        owner_user_id=user_id,
+                    )
+                    post_thread_plan_actions_message(
                         client,
                         channel,
                         thread_ts,
@@ -4624,6 +5099,135 @@ def build_app():
                 )
         except Exception as exc:  # pragma: no cover
             logger.exception("Failed updating collaboration mode card for %s: %r", user_id, exc)
+
+    @app.action(THREAD_PLAN_IMPLEMENT_CLEAN_ACTION)
+    @app.action(THREAD_PLAN_IMPLEMENT_HERE_ACTION)
+    @app.action(THREAD_PLAN_KEEP_PLANNING_ACTION)
+    def handle_thread_plan_action(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected plan action from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            thread_key, action_name = decode_thread_plan_action_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid plan action payload from %s: %r", user_id, exc)
+            return
+        if get_thread_owner_access_error(thread_key, user_id):
+            logger.warning(
+                "Rejected plan action for non-owner user %s thread %s",
+                user_id,
+                thread_key,
+            )
+            return
+        channel_id, thread_ts, message_ts = extract_action_channel_thread(body)
+        if not channel_id or not thread_ts:
+            return
+
+        if action_name == "keep_planning":
+            SESSION_STORE.set_collaboration_mode(
+                thread_key,
+                COLLABORATION_MODE_PLAN,
+                owner_user_id=user_id,
+            )
+            text, blocks = build_thread_plan_actions_message(
+                thread_key,
+                session_id=SESSION_STORE.get(thread_key),
+                footer_note="已保留 `Plan` 模式。接下来你可以继续在这个 Slack thread 补充、修改或细化方案。",
+            )
+            try:
+                if message_ts:
+                    client.chat_update(
+                        channel=channel_id,
+                        ts=message_ts,
+                        text=text,
+                        blocks=blocks,
+                    )
+                else:
+                    client.chat_postMessage(
+                        channel=channel_id,
+                        thread_ts=thread_ts,
+                        text=text,
+                        blocks=blocks,
+                    )
+            except Exception as exc:  # pragma: no cover
+                logger.exception("Failed updating keep-planning card for %s: %r", user_id, exc)
+            return
+
+        execution_mode = "clean" if action_name == "clean" else "here"
+        start_text = (
+            f"<@{user_id}> 正在按已批准的方案开始实施（`{execution_mode}`），请稍等。"
+        )
+        client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=start_text,
+        )
+        try:
+            codex_result, details = execute_plan_implementation_action(
+                client,
+                channel_id,
+                thread_ts,
+                thread_key,
+                user_id=user_id,
+                execution_mode=execution_mode,
+            )
+        except Exception as exc:
+            runtime_diagnostics = ""
+            if should_reset_runtime_after_exception(exc):
+                with suppress(Exception):
+                    runtime = get_app_runtime()
+                    runtime.reset()
+                    runtime_diagnostics = runtime.last_client_diagnostics()
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=build_process_error_message(user_id, exc, diagnostics=runtime_diagnostics),
+            )
+            logger.exception(
+                "Plan implementation action failed for %s thread %s: %r",
+                user_id,
+                thread_key,
+                exc,
+            )
+            return
+
+        next_session_id = details["next_session_id"]
+        planning_session_id = details["planning_session_id"]
+        workdir = details["workdir"]
+        prefix = (
+            "已切换到新的 implementation session。"
+            if execution_mode == "clean"
+            else "已在当前 session 中继续实施这份方案。"
+        )
+        result = (
+            f"{prefix}\n\n"
+            f"- planning_session_id: `{planning_session_id or '-'}`\n"
+            f"- implementation_session_id: `{next_session_id}`\n"
+            f"- workdir: `{workdir}`\n\n"
+            f"{codex_result.text}"
+        )
+        post_chunks(client, channel_id, thread_ts, result)
+        if response_contains_proposed_plan(codex_result.text):
+            persist_latest_proposed_plan(
+                thread_key,
+                codex_result.text,
+                session_id=next_session_id,
+                owner_user_id=user_id,
+            )
+            post_thread_plan_actions_message(
+                client,
+                channel_id,
+                thread_ts,
+                thread_key,
+                session_id=next_session_id,
+            )
 
     @app.action(REQUEST_USER_INPUT_OPEN_ACTION)
     def handle_request_user_input_open(ack, body, client, logger):
