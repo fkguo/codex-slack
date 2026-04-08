@@ -247,6 +247,9 @@ class SlackThreadSessionStore:
             progress_updates = normalize_progress_updates(value.get("progress_updates"))
             if progress_updates is not None:
                 entry["progress_updates"] = progress_updates
+            watch_enabled = value.get("watch_enabled")
+            if isinstance(watch_enabled, bool):
+                entry["watch_enabled"] = watch_enabled
             session_origin = value.get("session_origin")
             if session_origin in {SESSION_ORIGIN_ATTACHED, SESSION_ORIGIN_SLACK}:
                 entry["session_origin"] = session_origin
@@ -307,6 +310,7 @@ class SlackThreadSessionStore:
                 bool(entry.get("owner_user_id")),
                 bool(entry.get("reasoning_effort")),
                 "progress_updates" in entry,
+                "watch_enabled" in entry,
                 bool(entry.get("collaboration_mode")),
                 bool(entry.get("latest_plan_text")),
                 bool(entry.get("latest_plan_recommended_execution_mode")),
@@ -444,6 +448,16 @@ class SlackThreadSessionStore:
                 return None
             return normalize_progress_updates(entry.get("progress_updates"))
 
+    def get_watch_enabled(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            value = entry.get("watch_enabled")
+            if isinstance(value, bool):
+                return value
+            return None
+
     def get_collaboration_mode(self, key):
         with self._lock:
             entry = self._sessions.get(key)
@@ -559,6 +573,9 @@ class SlackThreadSessionStore:
             progress_updates = normalize_progress_updates(existing_entry.get("progress_updates"))
             if progress_updates is not None:
                 entry["progress_updates"] = progress_updates
+            watch_enabled = existing_entry.get("watch_enabled")
+            if isinstance(watch_enabled, bool):
+                entry["watch_enabled"] = watch_enabled
             collaboration_mode = normalize_collaboration_mode(existing_entry.get("collaboration_mode"))
             if collaboration_mode:
                 entry["collaboration_mode"] = collaboration_mode
@@ -651,6 +668,9 @@ class SlackThreadSessionStore:
             progress_updates = normalize_progress_updates(existing_entry.get("progress_updates"))
             if progress_updates is not None:
                 entry["progress_updates"] = progress_updates
+            watch_enabled = existing_entry.get("watch_enabled")
+            if isinstance(watch_enabled, bool):
+                entry["watch_enabled"] = watch_enabled
             collaboration_mode = normalize_collaboration_mode(existing_entry.get("collaboration_mode"))
             if collaboration_mode:
                 entry["collaboration_mode"] = collaboration_mode
@@ -783,6 +803,19 @@ class SlackThreadSessionStore:
         with self._lock:
             existing_entry = dict(self._sessions.get(key, {}))
             existing_entry["progress_updates"] = normalized_progress_updates
+            existing_entry["updated_at"] = int(time.time())
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
+            if effective_owner_user_id:
+                existing_entry["owner_user_id"] = effective_owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
+
+    def set_watch_enabled(self, key, watch_enabled, owner_user_id=None):
+        if not isinstance(watch_enabled, bool):
+            return
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["watch_enabled"] = watch_enabled
             existing_entry["updated_at"] = int(time.time())
             effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
             if effective_owner_user_id:
@@ -971,6 +1004,24 @@ class SlackThreadSessionStore:
             rows.sort(key=lambda row: row["updated_at"], reverse=True)
             if limit and limit > 0:
                 rows = rows[:limit]
+            return rows
+
+    def list_bindings(self):
+        with self._lock:
+            rows = []
+            for thread_key, entry in self._sessions.items():
+                session_id = str(entry.get("session_id") or "").strip()
+                if not session_id:
+                    continue
+                rows.append(
+                    {
+                        "thread_key": thread_key,
+                        "session_id": session_id,
+                        "owner_user_id": entry.get("owner_user_id"),
+                        "mode": entry.get("mode") or SESSION_MODE_CONTROL,
+                        "watch_enabled": bool(entry.get("watch_enabled")) if "watch_enabled" in entry else False,
+                    }
+                )
             return rows
 
 
@@ -3620,6 +3671,18 @@ def make_thread_key(channel, thread_ts):
     return f"{channel}:{thread_ts}"
 
 
+def parse_thread_key(thread_key):
+    normalized = str(thread_key or "").strip()
+    if not normalized or ":" not in normalized:
+        return None, None
+    channel, thread_ts = normalized.split(":", 1)
+    channel = str(channel or "").strip()
+    thread_ts = str(thread_ts or "").strip()
+    if not channel or not thread_ts:
+        return None, None
+    return channel, thread_ts
+
+
 def claim_thread_lock(thread_key):
     with THREAD_LOCKS_GUARD:
         state = THREAD_LOCKS.get(thread_key)
@@ -4256,12 +4319,16 @@ def clear_watcher(thread_key, watcher):
             WATCHERS.pop(thread_key, None)
 
 
-def stop_watcher(thread_key):
+def stop_watcher(thread_key, *, clear_watch_enabled=True):
     with WATCHERS_GUARD:
         watcher = WATCHERS.pop(thread_key, None)
     if watcher is None:
+        if clear_watch_enabled:
+            SESSION_STORE.set_watch_enabled(thread_key, False)
         return False
     watcher.stop_event.set()
+    if clear_watch_enabled:
+        SESSION_STORE.set_watch_enabled(thread_key, False)
     return True
 
 
@@ -4360,7 +4427,16 @@ async def _wait_for_watch_signal(client, watch_id, stop_event, timeout_seconds, 
     return "stopped"
 
 
-async def watch_loop_async(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key=None):
+async def watch_loop_async(
+    client,
+    channel,
+    thread_ts,
+    thread_key,
+    session_id,
+    stop_event,
+    last_event_key=None,
+    stop_when_idle=False,
+):
     failure_count = 0
     current_last_event_key = last_event_key
     poll_seconds = get_watch_poll_seconds()
@@ -4479,15 +4555,28 @@ async def watch_loop_async(client, channel, thread_ts, thread_key, session_id, s
             )
             last_snapshot = snapshot
             if not message:
+                if stop_when_idle and snapshot.status_type != "active":
+                    break
                 continue
             post_chunks(client, channel, thread_ts, message)
+            if stop_when_idle and snapshot.status_type != "active":
+                break
     finally:
         await _stop_fs_watch(watch_client, watch_id)
         with suppress(Exception):
             await watch_client.close()
 
 
-def watch_loop(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key=None):
+def watch_loop(
+    client,
+    channel,
+    thread_ts,
+    thread_key,
+    session_id,
+    stop_event,
+    last_event_key=None,
+    stop_when_idle=False,
+):
     try:
         asyncio.run(
             watch_loop_async(
@@ -4498,6 +4587,7 @@ def watch_loop(client, channel, thread_ts, thread_key, session_id, stop_event, l
                 session_id,
                 stop_event,
                 last_event_key=last_event_key,
+                stop_when_idle=stop_when_idle,
             )
         )
     finally:
@@ -4506,12 +4596,22 @@ def watch_loop(client, channel, thread_ts, thread_key, session_id, stop_event, l
             clear_watcher(thread_key, watcher)
 
 
-def start_watcher(client, channel, thread_ts, thread_key, session_id, last_event_key=None):
-    stop_watcher(thread_key)
+def start_watcher(
+    client,
+    channel,
+    thread_ts,
+    thread_key,
+    session_id,
+    last_event_key=None,
+    *,
+    persist_watch=True,
+    stop_when_idle=False,
+):
+    stop_watcher(thread_key, clear_watch_enabled=False)
     stop_event = threading.Event()
     thread = threading.Thread(
         target=watch_loop,
-        args=(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key),
+        args=(client, channel, thread_ts, thread_key, session_id, stop_event, last_event_key, stop_when_idle),
         daemon=True,
     )
     watcher = WatchHandle(
@@ -4524,6 +4624,8 @@ def start_watcher(client, channel, thread_ts, thread_key, session_id, last_event
     with WATCHERS_GUARD:
         WATCHERS[thread_key] = watcher
         thread.start()
+    if persist_watch:
+        SESSION_STORE.set_watch_enabled(thread_key, True)
     return watcher
 
 
@@ -6060,6 +6162,64 @@ def get_home_recent_sessions_rows(limit=5, exclude_thread_ids=None):
     return rows
 
 
+def get_latest_event_key_for_session(session_id):
+    events = read_conversation_events(session_id)
+    if not events:
+        return None
+    return get_event_key(events[-1])
+
+
+def should_restore_control_recovery_watch(session_id):
+    if not session_id:
+        return False
+    try:
+        thread_response = read_thread_response(session_id, include_turns=False)
+    except Exception:
+        return False
+    return extract_thread_status_type(thread_response) == "active"
+
+
+def restore_background_watchers(client):
+    restored = 0
+    for binding in SESSION_STORE.list_bindings():
+        thread_key = binding.get("thread_key")
+        session_id = binding.get("session_id")
+        channel, thread_ts = parse_thread_key(thread_key)
+        if not thread_key or not session_id or not channel or not thread_ts:
+            continue
+        if get_watcher(thread_key):
+            continue
+
+        mode = binding.get("mode") or SESSION_MODE_CONTROL
+        persist_watch = bool(binding.get("watch_enabled"))
+        stop_when_idle = False
+
+        if not persist_watch and mode == SESSION_MODE_CONTROL:
+            if not should_restore_control_recovery_watch(session_id):
+                continue
+            stop_when_idle = True
+        elif not persist_watch:
+            continue
+
+        try:
+            last_event_key = get_latest_event_key_for_session(session_id)
+        except Exception:
+            continue
+
+        start_watcher(
+            client,
+            channel,
+            thread_ts,
+            thread_key,
+            session_id,
+            last_event_key=last_event_key,
+            persist_watch=persist_watch,
+            stop_when_idle=stop_when_idle,
+        )
+        restored += 1
+    return restored
+
+
 def publish_home_view(client, user_id):
     codex_bin, model, default_workdir, timeout, sandbox, _extra_args, full_auto = get_codex_settings()
     binding_rows = get_home_bindings_rows(user_id, limit=5)
@@ -6689,6 +6849,9 @@ def build_app():
             return
         logger.info("Handling direct message in channel %s", channel)
         start_background_job(client, channel, thread_ts, prompt, user_id, slack_event_payload=body)
+
+    with suppress(Exception):
+        restore_background_watchers(app.client)
 
     return app
 

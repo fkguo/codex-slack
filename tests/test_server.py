@@ -340,6 +340,17 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(reloaded.get_collaboration_mode("C1:1"), server.COLLABORATION_MODE_PLAN)
         self.assertEqual(reloaded.get_owner("C1:1"), "U111")
 
+    def test_set_and_reload_preserves_watch_enabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.json"
+            store = server.SlackThreadSessionStore(path)
+            store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
+            store.set_watch_enabled("C1:1", True, owner_user_id="U111")
+
+            reloaded = server.SlackThreadSessionStore(path)
+
+        self.assertTrue(reloaded.get_watch_enabled("C1:1"))
+
     def test_attach_session_defaults_to_observe_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
@@ -1247,6 +1258,59 @@ class ProcessPromptTests(unittest.TestCase):
         build_watch_bootstrap.assert_called_once_with(self.session_id)
         start_watcher.assert_called_once()
         self.assertIn("已开始持续 watch", self.client.messages[0]["text"])
+
+    def test_restore_background_watchers_restarts_persisted_watch(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
+        self.store.set_watch_enabled(self.thread_key, True, owner_user_id=self.user_id)
+
+        with patch.object(server, "get_latest_event_key_for_session", return_value=("turn-2", "a2")):
+            with patch.object(server, "start_watcher") as start_watcher:
+                restored = server.restore_background_watchers(self.client)
+
+        self.assertEqual(restored, 1)
+        start_watcher.assert_called_once_with(
+            self.client,
+            self.channel,
+            self.thread_ts,
+            self.thread_key,
+            self.session_id,
+            last_event_key=("turn-2", "a2"),
+            persist_watch=True,
+            stop_when_idle=False,
+        )
+
+    def test_restore_background_watchers_starts_ephemeral_watch_for_active_control_session(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+
+        with patch.object(server, "should_restore_control_recovery_watch", return_value=True):
+            with patch.object(server, "get_latest_event_key_for_session", return_value=("turn-9", "a9")):
+                with patch.object(server, "start_watcher") as start_watcher:
+                    restored = server.restore_background_watchers(self.client)
+
+        self.assertEqual(restored, 1)
+        start_watcher.assert_called_once_with(
+            self.client,
+            self.channel,
+            self.thread_ts,
+            self.thread_key,
+            self.session_id,
+            last_event_key=("turn-9", "a9"),
+            persist_watch=False,
+            stop_when_idle=True,
+        )
+
+    def test_restore_background_watchers_skips_idle_control_session_without_watch(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+
+        with patch.object(server, "should_restore_control_recovery_watch", return_value=False):
+            with patch.object(server, "start_watcher") as start_watcher:
+                restored = server.restore_background_watchers(self.client)
+
+        self.assertEqual(restored, 0)
+        start_watcher.assert_not_called()
 
     def test_watch_rejects_extra_arguments(self):
         server.process_prompt(self.client, self.channel, self.thread_ts, "watch raw", self.user_id)
