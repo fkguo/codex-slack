@@ -6016,7 +6016,12 @@ def get_home_bindings_rows(user_id, limit=5):
     return rows
 
 
-def get_home_recent_sessions_rows(limit=5):
+def get_home_recent_sessions_rows(limit=5, exclude_thread_ids=None):
+    excluded_thread_ids = {
+        str(thread_id or "").strip()
+        for thread_id in (exclude_thread_ids or [])
+        if str(thread_id or "").strip()
+    }
     try:
         response = thread_views.list_threads(
             get_codex_app_server_config(),
@@ -6037,23 +6042,31 @@ def get_home_recent_sessions_rows(limit=5):
         ]
 
     rows = []
-    for summary in summaries[:limit]:
+    for summary in summaries:
+        thread_id = str(summary.thread_id or "").strip()
+        if not thread_id or thread_id in excluded_thread_ids:
+            continue
         rows.append(
             {
                 "label": summary.name or summary.preview or "(untitled)",
-                "thread_id": summary.thread_id or "-",
+                "thread_id": thread_id or "-",
                 "title": summary.name or summary.preview or "(untitled)",
                 "cwd": summary.cwd or "-",
                 "status": summary.status_type or "-",
             }
         )
+        if len(rows) >= limit:
+            break
     return rows
 
 
 def publish_home_view(client, user_id):
     codex_bin, model, default_workdir, timeout, sandbox, _extra_args, full_auto = get_codex_settings()
     binding_rows = get_home_bindings_rows(user_id, limit=5)
-    recent_rows = get_home_recent_sessions_rows(limit=5)
+    recent_rows = get_home_recent_sessions_rows(
+        limit=5,
+        exclude_thread_ids=[row.get("session_id") for row in binding_rows],
+    )
     bindings_summary = slack_home.format_binding_summary_rows(binding_rows)
     recent_sessions_summary = slack_home.format_recent_sessions_rows(recent_rows)
     help_text = (

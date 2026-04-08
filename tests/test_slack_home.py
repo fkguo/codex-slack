@@ -280,6 +280,36 @@ class ServerAppHomeHelpersTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "idle")
         self.assertEqual(rows[0]["cwd"], "/repo")
 
+    def test_get_home_recent_sessions_rows_excludes_existing_bindings(self):
+        summaries = [
+            ThreadSummary(
+                thread_id="thr_1",
+                preview="Bound thread",
+                cwd="/repo/a",
+                updated_at=1700000000,
+                created_at=1690000000,
+                status_type="idle",
+                source="cli",
+                name="bound",
+            ),
+            ThreadSummary(
+                thread_id="thr_2",
+                preview="Fresh thread",
+                cwd="/repo/b",
+                updated_at=1700000001,
+                created_at=1690000001,
+                status_type="active",
+                source="cli",
+                name="fresh",
+            ),
+        ]
+        with patch.object(server.thread_views, "list_threads", return_value={"data": []}):
+            with patch.object(server.thread_views, "extract_thread_summaries", return_value=summaries):
+                rows = server.get_home_recent_sessions_rows(limit=5, exclude_thread_ids=["thr_1"])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["thread_id"], "thr_2")
+
     def test_get_home_recent_sessions_rows_error(self):
         with patch.object(server.thread_views, "list_threads", side_effect=RuntimeError("boom")):
             rows = server.get_home_recent_sessions_rows(limit=5)
@@ -321,6 +351,25 @@ class ServerAppHomeHelpersTests(unittest.TestCase):
         joined = "\n".join(text_blocks)
         self.assertIn("workspace-write", joined)
         self.assertIn("full_auto=`0`", joined)
+
+    def test_publish_home_view_excludes_bound_session_ids_from_recent_rows(self):
+        client = DummyViewClient()
+        binding_rows = [
+            {
+                "label": "DM Control",
+                "session_id": "sess-1",
+                "mode": "control",
+                "cwd": "/repo",
+                "updated_at": "2026-04-08 20:00:00",
+            }
+        ]
+        with patch.object(server, "get_home_bindings_rows", return_value=binding_rows):
+            with patch.object(server, "get_home_recent_sessions_rows", return_value=[]) as get_recent_rows:
+                with patch.object(server, "get_codex_settings", return_value=("codex", "gpt-5.4", "/repo", 900, "workspace-write", "", False)):
+                    with patch.object(server, "get_default_reasoning_effort", return_value="xhigh"):
+                        server.publish_home_view(client, "U123")
+
+        self.assertEqual(get_recent_rows.call_args.kwargs["exclude_thread_ids"], ["sess-1"])
 
 
 if __name__ == "__main__":
