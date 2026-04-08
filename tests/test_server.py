@@ -351,6 +351,37 @@ class SessionStoreTests(unittest.TestCase):
 
         self.assertTrue(reloaded.get_watch_enabled("C1:1"))
 
+    def test_set_and_reload_preserves_watch_last_event_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.json"
+            store = server.SlackThreadSessionStore(path)
+            store.set("C1:1", "019d5868-71ba-7101-9143-81867f3db5bf", owner_user_id="U111")
+            store.set_watch_last_event_key(
+                "C1:1",
+                "019d5868-71ba-7101-9143-81867f3db5bf",
+                ("turn-2", "a2"),
+                owner_user_id="U111",
+            )
+
+            reloaded = server.SlackThreadSessionStore(path)
+
+        self.assertEqual(
+            reloaded.get_watch_last_event_key(
+                "C1:1",
+                current_session_id="019d5868-71ba-7101-9143-81867f3db5bf",
+            ),
+            ("turn-2", "a2"),
+        )
+
+    def test_get_watch_last_event_key_ignores_mismatched_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.json"
+            store = server.SlackThreadSessionStore(path)
+            store.set("C1:1", "sess-1", owner_user_id="U111")
+            store.set_watch_last_event_key("C1:1", "sess-1", ("turn-2", "a2"), owner_user_id="U111")
+
+            self.assertIsNone(store.get_watch_last_event_key("C1:1", current_session_id="sess-other"))
+
     def test_attach_session_defaults_to_observe_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = server.SlackThreadSessionStore(Path(tmpdir) / "sessions.json")
@@ -1263,19 +1294,27 @@ class ProcessPromptTests(unittest.TestCase):
         self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
         self.store.set_mode(self.thread_key, server.SESSION_MODE_OBSERVE)
         self.store.set_watch_enabled(self.thread_key, True, owner_user_id=self.user_id)
+        self.store.set_watch_last_event_key(
+            self.thread_key,
+            self.session_id,
+            ("turn-persisted", "a-persisted"),
+            owner_user_id=self.user_id,
+        )
 
-        with patch.object(server, "get_latest_event_key_for_session", return_value=("turn-2", "a2")):
+        with patch.object(server, "get_latest_event_key_for_session") as get_latest_event_key:
             with patch.object(server, "start_watcher") as start_watcher:
                 restored = server.restore_background_watchers(self.client)
 
-        self.assertEqual(restored, 1)
+        self.assertEqual(restored["restored_count"], 1)
+        self.assertEqual(restored["restored"][0]["cursor_source"], "persisted")
+        get_latest_event_key.assert_not_called()
         start_watcher.assert_called_once_with(
             self.client,
             self.channel,
             self.thread_ts,
             self.thread_key,
             self.session_id,
-            last_event_key=("turn-2", "a2"),
+            last_event_key=("turn-persisted", "a-persisted"),
             persist_watch=True,
             stop_when_idle=False,
         )
@@ -1289,7 +1328,8 @@ class ProcessPromptTests(unittest.TestCase):
                 with patch.object(server, "start_watcher") as start_watcher:
                     restored = server.restore_background_watchers(self.client)
 
-        self.assertEqual(restored, 1)
+        self.assertEqual(restored["restored_count"], 1)
+        self.assertEqual(restored["restored"][0]["cursor_source"], "latest")
         start_watcher.assert_called_once_with(
             self.client,
             self.channel,
@@ -1309,7 +1349,8 @@ class ProcessPromptTests(unittest.TestCase):
             with patch.object(server, "start_watcher") as start_watcher:
                 restored = server.restore_background_watchers(self.client)
 
-        self.assertEqual(restored, 0)
+        self.assertEqual(restored["restored_count"], 0)
+        self.assertEqual(restored["skipped"][0]["reason"], "idle_control_session")
         start_watcher.assert_not_called()
 
     def test_watch_rejects_extra_arguments(self):

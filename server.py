@@ -295,6 +295,12 @@ class SlackThreadSessionStore:
             )
             if pending_subagent_target:
                 entry["pending_subagent_target"] = pending_subagent_target
+            watch_last_event_key = self._normalize_watch_last_event_key(
+                value.get("watch_last_event_key"),
+                current_session_id=session_id or None,
+            )
+            if watch_last_event_key:
+                entry["watch_last_event_key"] = watch_last_event_key
             if not self._has_persisted_state(entry):
                 continue
             normalized[key] = entry
@@ -316,6 +322,7 @@ class SlackThreadSessionStore:
                 bool(entry.get("latest_plan_recommended_execution_mode")),
                 bool(entry.get("latest_plan_selected_action")),
                 bool(entry.get("pending_subagent_target")),
+                bool(entry.get("watch_last_event_key")),
             ]
         )
 
@@ -373,6 +380,46 @@ class SlackThreadSessionStore:
         if pending_target:
             return pending_target
         return None
+
+    @staticmethod
+    def _normalize_watch_last_event_key(value, *, current_session_id=None):
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            value = {
+                "turn_id": value[0],
+                "item_id": value[1],
+                "session_id": current_session_id,
+                "updated_at": int(time.time()),
+            }
+        if not isinstance(value, dict):
+            return None
+        turn_id = str(value.get("turn_id") or "").strip()
+        item_id = str(value.get("item_id") or "").strip()
+        session_id = str(value.get("session_id") or "").strip()
+        updated_at = value.get("updated_at")
+        try:
+            updated_at = int(updated_at)
+        except (TypeError, ValueError):
+            updated_at = int(time.time())
+        if not turn_id or not item_id:
+            return None
+        if current_session_id and session_id and session_id != str(current_session_id).strip():
+            return None
+        normalized = {
+            "turn_id": turn_id,
+            "item_id": item_id,
+            "updated_at": max(0, updated_at),
+        }
+        effective_session_id = str(current_session_id or session_id or "").strip()
+        if effective_session_id:
+            normalized["session_id"] = effective_session_id
+        return normalized
+
+    @staticmethod
+    def _preserve_watch_last_event_key(existing_entry, session_id):
+        return SlackThreadSessionStore._normalize_watch_last_event_key(
+            read_field(existing_entry or {}, "watch_last_event_key"),
+            current_session_id=session_id,
+        )
 
     def _save_locked(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -464,6 +511,30 @@ class SlackThreadSessionStore:
             if not entry:
                 return None
             return normalize_collaboration_mode(entry.get("collaboration_mode"))
+
+    def get_watch_last_event_key(self, key, *, current_session_id=None):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            normalized = self._normalize_watch_last_event_key(
+                entry.get("watch_last_event_key"),
+                current_session_id=current_session_id or entry.get("session_id"),
+            )
+            if normalized:
+                if normalized != entry.get("watch_last_event_key"):
+                    entry["watch_last_event_key"] = normalized
+                    entry["updated_at"] = int(time.time())
+                    self._save_locked()
+                return (normalized.get("turn_id"), normalized.get("item_id"))
+            if "watch_last_event_key" in entry:
+                entry.pop("watch_last_event_key", None)
+                if self._has_persisted_state(entry):
+                    entry["updated_at"] = int(time.time())
+                else:
+                    self._sessions.pop(key, None)
+                self._save_locked()
+            return None
 
     def get_latest_plan(self, key):
         with self._lock:
@@ -616,6 +687,9 @@ class SlackThreadSessionStore:
             )
             if effective_session_cwd:
                 entry["session_cwd"] = effective_session_cwd
+            watch_last_event_key = self._preserve_watch_last_event_key(existing_entry, session_id)
+            if watch_last_event_key:
+                entry["watch_last_event_key"] = watch_last_event_key
             pending_subagent_target = self._preserve_pending_subagent_target(existing_entry, session_id)
             if pending_subagent_target:
                 entry["pending_subagent_target"] = pending_subagent_target
@@ -708,6 +782,9 @@ class SlackThreadSessionStore:
             )
             if effective_session_cwd:
                 entry["session_cwd"] = effective_session_cwd
+            watch_last_event_key = self._preserve_watch_last_event_key(existing_entry, session_id)
+            if watch_last_event_key:
+                entry["watch_last_event_key"] = watch_last_event_key
             pending_subagent_target = self._preserve_pending_subagent_target(existing_entry, session_id)
             if pending_subagent_target:
                 entry["pending_subagent_target"] = pending_subagent_target
@@ -822,6 +899,42 @@ class SlackThreadSessionStore:
                 existing_entry["owner_user_id"] = effective_owner_user_id
             self._sessions[key] = existing_entry
             self._save_locked()
+
+    def set_watch_last_event_key(self, key, session_id, event_key, owner_user_id=None):
+        normalized = self._normalize_watch_last_event_key(
+            {
+                "turn_id": event_key[0] if isinstance(event_key, (list, tuple)) and len(event_key) == 2 else None,
+                "item_id": event_key[1] if isinstance(event_key, (list, tuple)) and len(event_key) == 2 else None,
+                "session_id": session_id,
+                "updated_at": int(time.time()),
+            },
+            current_session_id=session_id,
+        )
+        if not normalized:
+            return
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["watch_last_event_key"] = normalized
+            existing_entry["updated_at"] = int(time.time())
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
+            if effective_owner_user_id:
+                existing_entry["owner_user_id"] = effective_owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
+
+    def clear_watch_last_event_key(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry or "watch_last_event_key" not in entry:
+                return False
+            entry.pop("watch_last_event_key", None)
+            if self._has_persisted_state(entry):
+                entry["updated_at"] = int(time.time())
+                self._save_locked()
+                return True
+            self._sessions.pop(key, None)
+            self._save_locked()
+            return True
 
     def clear_progress_updates(self, key):
         with self._lock:
@@ -958,6 +1071,7 @@ class SlackThreadSessionStore:
             entry.pop("session_origin", None)
             entry.pop("session_cwd", None)
             entry.pop("pending_subagent_target", None)
+            entry.pop("watch_last_event_key", None)
             entry["updated_at"] = int(time.time())
             if self._has_persisted_state(entry):
                 self._save_locked()
@@ -1011,6 +1125,10 @@ class SlackThreadSessionStore:
                         "owner_user_id": entry.get("owner_user_id"),
                         "mode": entry.get("mode") or SESSION_MODE_CONTROL,
                         "watch_enabled": bool(entry.get("watch_enabled")) if "watch_enabled" in entry else False,
+                        "watch_last_event_key": self._normalize_watch_last_event_key(
+                            entry.get("watch_last_event_key"),
+                            current_session_id=session_id,
+                        ),
                     }
                 )
             return rows
@@ -4534,11 +4652,14 @@ async def watch_loop_async(
                 continue
 
             events = extract_conversation_events(thread_response)
+            previous_last_event_key = current_last_event_key
             message, current_last_event_key, _rebased = advance_watch_cursor(
                 events,
                 current_last_event_key,
                 session_id,
             )
+            if current_last_event_key and current_last_event_key != previous_last_event_key:
+                SESSION_STORE.set_watch_last_event_key(thread_key, session_id, current_last_event_key)
             last_snapshot = snapshot
             if not message:
                 if stop_when_idle and snapshot.status_type != "active":
@@ -6178,14 +6299,29 @@ def should_restore_control_recovery_watch(session_id):
 
 
 def restore_background_watchers(client):
-    restored = 0
+    restored = []
+    skipped = []
     for binding in SESSION_STORE.list_bindings():
         thread_key = binding.get("thread_key")
         session_id = binding.get("session_id")
         channel, thread_ts = parse_thread_key(thread_key)
         if not thread_key or not session_id or not channel or not thread_ts:
+            skipped.append(
+                {
+                    "thread_key": thread_key or "-",
+                    "session_id": session_id or "-",
+                    "reason": "invalid_binding",
+                }
+            )
             continue
         if get_watcher(thread_key):
+            skipped.append(
+                {
+                    "thread_key": thread_key,
+                    "session_id": session_id,
+                    "reason": "watcher_already_running",
+                }
+            )
             continue
 
         mode = binding.get("mode") or SESSION_MODE_CONTROL
@@ -6194,14 +6330,40 @@ def restore_background_watchers(client):
 
         if not persist_watch and mode == SESSION_MODE_CONTROL:
             if not should_restore_control_recovery_watch(session_id):
+                skipped.append(
+                    {
+                        "thread_key": thread_key,
+                        "session_id": session_id,
+                        "reason": "idle_control_session",
+                    }
+                )
                 continue
             stop_when_idle = True
         elif not persist_watch:
+            skipped.append(
+                {
+                    "thread_key": thread_key,
+                    "session_id": session_id,
+                    "reason": "watch_not_enabled",
+                }
+            )
             continue
 
+        persisted_last_event_key = SESSION_STORE.get_watch_last_event_key(
+            thread_key,
+            current_session_id=session_id,
+        )
+        cursor_source = "persisted" if persisted_last_event_key else "latest"
         try:
-            last_event_key = get_latest_event_key_for_session(session_id)
-        except Exception:
+            last_event_key = persisted_last_event_key or get_latest_event_key_for_session(session_id)
+        except Exception as exc:
+            skipped.append(
+                {
+                    "thread_key": thread_key,
+                    "session_id": session_id,
+                    "reason": f"read_failed: {truncate_text(str(exc), max_length=120)}",
+                }
+            )
             continue
 
         start_watcher(
@@ -6214,8 +6376,22 @@ def restore_background_watchers(client):
             persist_watch=persist_watch,
             stop_when_idle=stop_when_idle,
         )
-        restored += 1
-    return restored
+        restored.append(
+            {
+                "thread_key": thread_key,
+                "session_id": session_id,
+                "mode": mode,
+                "persist_watch": persist_watch,
+                "stop_when_idle": stop_when_idle,
+                "cursor_source": cursor_source,
+                "last_event_key": last_event_key,
+            }
+        )
+    return {
+        "restored_count": len(restored),
+        "restored": restored,
+        "skipped": skipped,
+    }
 
 
 def publish_home_view(client, user_id):
@@ -6874,7 +7050,33 @@ def build_app():
         start_background_job(client, channel, thread_ts, prompt, user_id, slack_event_payload=body)
 
     with suppress(Exception):
-        restore_background_watchers(app.client)
+        restore_result = restore_background_watchers(app.client)
+        print(
+            "[watcher_restore]"
+            f" restored={restore_result.get('restored_count', 0)}"
+            f" skipped={len(restore_result.get('skipped', []))}",
+            flush=True,
+        )
+        for row in restore_result.get("restored", []):
+            print(
+                "[watcher_restore_ok]"
+                f" thread_key={row.get('thread_key')}"
+                f" session_id={row.get('session_id')}"
+                f" mode={row.get('mode')}"
+                f" persist_watch={row.get('persist_watch')}"
+                f" stop_when_idle={row.get('stop_when_idle')}"
+                f" cursor_source={row.get('cursor_source')}"
+                f" last_event_key={row.get('last_event_key')}",
+                flush=True,
+            )
+        for row in restore_result.get("skipped", []):
+            print(
+                "[watcher_restore_skip]"
+                f" thread_key={row.get('thread_key')}"
+                f" session_id={row.get('session_id')}"
+                f" reason={row.get('reason')}",
+                flush=True,
+            )
 
     return app
 
