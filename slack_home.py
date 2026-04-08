@@ -1,5 +1,11 @@
 from typing import Mapping, Optional, Sequence
 
+MAX_BLOCK_TEXT_LENGTH = 3000
+MAX_ROW_LABEL_LENGTH = 120
+MAX_ROW_TITLE_LENGTH = 160
+MAX_ROW_CWD_LENGTH = 120
+MAX_ROW_STATUS_LENGTH = 180
+
 MRKDWN_TEXT_REPLACEMENTS = str.maketrans(
     {
         "&": "&amp;",
@@ -32,19 +38,28 @@ def _as_optional_text(value):
     return normalized or None
 
 
-def _as_inline_text(value, default="-"):
+def _truncate_text(value, max_length):
+    text = str(value or "")
+    if max_length is None or max_length <= 0 or len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    return text[: max_length - 3].rstrip() + "..."
+
+
+def _as_inline_text(value, default="-", max_length=None):
     normalized = _as_optional_text(value)
     if not normalized:
         return default
-    return " ".join(normalized.split())
+    return _truncate_text(" ".join(normalized.split()), max_length)
 
 
-def _escape_mrkdwn_text(value, default="-"):
-    return _as_inline_text(value, default=default).translate(MRKDWN_TEXT_REPLACEMENTS)
+def _escape_mrkdwn_text(value, default="-", max_length=None):
+    return _as_inline_text(value, default=default, max_length=max_length).translate(MRKDWN_TEXT_REPLACEMENTS)
 
 
-def _escape_mrkdwn_code(value, default="-"):
-    return _as_text(value, default=default).translate(MRKDWN_CODE_REPLACEMENTS)
+def _escape_mrkdwn_code(value, default="-", max_length=None):
+    return _truncate_text(_as_text(value, default=default), max_length).translate(MRKDWN_CODE_REPLACEMENTS)
 
 
 def _as_rows(rows):
@@ -58,12 +73,20 @@ def _as_rows(rows):
 
 
 def _binding_row_text(row, index):
-    label = _escape_mrkdwn_text(row.get("label"), default=f"Binding {index}")
-    session_id = _escape_mrkdwn_code(row.get("session_id"))
-    mode = _escape_mrkdwn_code(row.get("mode"))
-    cwd = _escape_mrkdwn_code(row.get("cwd"))
-    updated_at = _escape_mrkdwn_code(row.get("updated_at"))
-    status_text = _escape_mrkdwn_text(row.get("status_text"), default="")
+    label = _escape_mrkdwn_text(
+        row.get("label"),
+        default=f"Binding {index}",
+        max_length=MAX_ROW_LABEL_LENGTH,
+    )
+    session_id = _escape_mrkdwn_code(row.get("session_id"), max_length=120)
+    mode = _escape_mrkdwn_code(row.get("mode"), max_length=40)
+    cwd = _escape_mrkdwn_code(row.get("cwd"), max_length=MAX_ROW_CWD_LENGTH)
+    updated_at = _escape_mrkdwn_code(row.get("updated_at"), max_length=64)
+    status_text = _escape_mrkdwn_text(
+        row.get("status_text"),
+        default="",
+        max_length=MAX_ROW_STATUS_LENGTH,
+    )
     lines = [
         f"*{index}. {label}*",
         f"`{session_id}` | mode=`{mode}`",
@@ -75,12 +98,24 @@ def _binding_row_text(row, index):
 
 
 def _recent_row_text(row, index):
-    label = _escape_mrkdwn_text(row.get("label"), default=f"Session {index}")
-    thread_id = _escape_mrkdwn_code(row.get("thread_id"))
-    title = _escape_mrkdwn_text(row.get("title"), default="(untitled)")
-    cwd = _escape_mrkdwn_code(row.get("cwd"))
-    status = _escape_mrkdwn_code(row.get("status"))
-    status_text = _escape_mrkdwn_text(row.get("status_text"), default="")
+    label = _escape_mrkdwn_text(
+        row.get("label"),
+        default=f"Session {index}",
+        max_length=MAX_ROW_LABEL_LENGTH,
+    )
+    thread_id = _escape_mrkdwn_code(row.get("thread_id"), max_length=120)
+    title = _escape_mrkdwn_text(
+        row.get("title"),
+        default="(untitled)",
+        max_length=MAX_ROW_TITLE_LENGTH,
+    )
+    cwd = _escape_mrkdwn_code(row.get("cwd"), max_length=MAX_ROW_CWD_LENGTH)
+    status = _escape_mrkdwn_code(row.get("status"), max_length=40)
+    status_text = _escape_mrkdwn_text(
+        row.get("status_text"),
+        default="",
+        max_length=MAX_ROW_STATUS_LENGTH,
+    )
     lines = [
         f"*{index}. {label}*",
         f"`{thread_id}` | {title}",
@@ -92,9 +127,10 @@ def _recent_row_text(row, index):
 
 
 def _build_row_section(text, row):
+    safe_text = _truncate_text(text, MAX_BLOCK_TEXT_LENGTH)
     section = {
         "type": "section",
-        "text": {"type": "mrkdwn", "text": text},
+        "text": {"type": "mrkdwn", "text": safe_text},
     }
     action_id = _as_optional_text(row.get("action_id"))
     action_value = _as_optional_text(row.get("action_value"))
@@ -119,7 +155,45 @@ def _append_rich_rows(blocks, *, title, rows, row_renderer, empty_text):
 
 def _append_legacy_summary(blocks, *, title, summary):
     blocks.append({"type": "header", "text": {"type": "plain_text", "text": title}})
-    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _as_text(summary, default="-")}})
+    blocks.append(
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": _truncate_text(_as_text(summary, default="-"), MAX_BLOCK_TEXT_LENGTH),
+            },
+        }
+    )
+
+
+def _append_context_blocks(blocks, lines):
+    pending = []
+    current_length = 0
+    max_chunk_length = MAX_BLOCK_TEXT_LENGTH
+
+    for line in lines:
+        normalized_line = _truncate_text(_as_text(line, default=""), max_chunk_length)
+        projected = len(normalized_line) if not pending else current_length + 1 + len(normalized_line)
+        if pending and projected > max_chunk_length:
+            blocks.append(
+                {
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": "\n".join(pending)}],
+                }
+            )
+            pending = [normalized_line]
+            current_length = len(normalized_line)
+            continue
+        pending.append(normalized_line)
+        current_length = projected
+
+    if pending:
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": "\n".join(pending)}],
+            }
+        )
 
 
 def format_binding_summary_rows(rows):
@@ -233,15 +307,8 @@ def build_home_view(
             context_lines.append(f"- {line}")
         if hint_text:
             context_lines.append(hint_text)
-        blocks.extend(
-            [
-                {"type": "divider"},
-                {
-                    "type": "context",
-                    "elements": [{"type": "mrkdwn", "text": "\n".join(context_lines)}],
-                },
-            ]
-        )
+        blocks.append({"type": "divider"})
+        _append_context_blocks(blocks, context_lines)
     return {
         "type": "home",
         "blocks": blocks,

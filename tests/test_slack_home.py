@@ -213,6 +213,51 @@ class SlackHomeViewTests(unittest.TestCase):
         self.assertIn("No bindings yet", joined)
         self.assertIn("No recent sessions found", joined)
 
+    def test_build_home_view_truncates_overlong_recent_row_text(self):
+        long_title = "very-long-title-" * 400
+        view = slack_home.build_home_view(
+            default_workdir="/tmp/project",
+            default_model="gpt-5.4",
+            default_effort="xhigh",
+            bindings_summary="ignored",
+            recent_sessions_summary="ignored",
+            bindings_rows=[],
+            recent_sessions_rows=[
+                {
+                    "label": "Recent 1",
+                    "thread_id": "thr-1",
+                    "title": long_title,
+                    "cwd": "/tmp/project",
+                    "status": "idle",
+                }
+            ],
+        )
+
+        section_blocks = [block for block in view["blocks"] if block.get("type") == "section"]
+        long_row_block = next(
+            block for block in section_blocks if "thr-1" in block.get("text", {}).get("text", "")
+        )
+        self.assertLessEqual(len(long_row_block["text"]["text"]), 3000)
+        self.assertIn("...", long_row_block["text"]["text"])
+
+    def test_build_home_view_splits_overlong_context_text(self):
+        long_help = "help-line " * 500
+        view = slack_home.build_home_view(
+            default_workdir="/tmp/project",
+            default_model="gpt-5.4",
+            default_effort="xhigh",
+            bindings_summary="binding summary",
+            recent_sessions_summary="recent summary",
+            quick_hints=["hint"] * 40,
+            help_text=long_help,
+        )
+
+        context_blocks = [block for block in view["blocks"] if block.get("type") == "context"]
+        self.assertGreaterEqual(len(context_blocks), 1)
+        for block in context_blocks:
+            for element in block.get("elements", []):
+                self.assertLessEqual(len(element.get("text", "")), 3000)
+
 
 class ServerAppHomeHelpersTests(unittest.TestCase):
     def test_get_home_recent_sessions_rows_success(self):
