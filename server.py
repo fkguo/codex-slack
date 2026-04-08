@@ -1,29 +1,41 @@
 import atexit
 import asyncio
+import concurrent.futures
 import json
 import os
 import queue
 import re
 import shlex
+import socket
+import ssl
 import subprocess
 import tempfile
 import threading
 import time
+import traceback
+import urllib.error
+import uuid
 import warnings
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from app_runtime import AppServerRuntime
+from app_runtime import (
+    AppServerRuntime,
+    RuntimeUserInputQuestion,
+    RuntimeUserInputRequest,
+)
 import codex_threads as thread_views
 import session_catalog
 import slack_document_inputs
 import slack_home
 import slack_image_inputs
+from codex_app_server_sdk.errors import CodexProtocolError, CodexTimeoutError, CodexTransportError
 from codex_app_server_sdk.models import ThreadConfig, TurnOverrides
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk.errors import SlackApiError
 from turn_control import ActiveTurnRegistry
 
 warnings.filterwarnings(
@@ -76,6 +88,16 @@ SESSION_MODE_OBSERVE = "observe"
 SESSION_MODE_CONTROL = "control"
 SESSION_ORIGIN_ATTACHED = "attached"
 SESSION_ORIGIN_SLACK = "slack"
+COLLABORATION_MODE_DEFAULT = "default"
+COLLABORATION_MODE_PLAN = "plan"
+SUPPORTED_COLLABORATION_MODES = (COLLABORATION_MODE_DEFAULT, COLLABORATION_MODE_PLAN)
+THREAD_COLLABORATION_MODE_ACTION = "thread_collaboration_mode_set"
+THREAD_COLLABORATION_MODE_PLAN_ACTION = f"{THREAD_COLLABORATION_MODE_ACTION}_plan"
+THREAD_COLLABORATION_MODE_DEFAULT_ACTION = f"{THREAD_COLLABORATION_MODE_ACTION}_default"
+REQUEST_USER_INPUT_OPEN_ACTION = "request_user_input_open"
+REQUEST_USER_INPUT_CANCEL_ACTION = "request_user_input_cancel"
+REQUEST_USER_INPUT_SUBMIT_CALLBACK = "request_user_input_submit"
+REQUEST_USER_INPUT_OTHER_VALUE = "__other__"
 DEFAULT_REASONING_EFFORT = "xhigh"
 SUPPORTED_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 DEFAULT_WATCH_POLL_SECONDS = 5
@@ -85,6 +107,7 @@ DEFAULT_PROGRESS_HEARTBEAT_SECONDS = 300
 DEFAULT_PROGRESS_POLL_SECONDS = 15
 DEFAULT_PROGRESS_BATCH_SECONDS = 5.0
 MAX_APP_SERVER_RETRIES = 2
+DEFAULT_APP_SERVER_RESUME_MAX_RETRIES = 2
 MAX_WATCH_READ_FAILURES = 2
 DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES = 32 * 1024 * 1024
 DEFAULT_IMAGE_ONLY_PROMPT = "请查看我附上的图片，并按我的上下文继续处理。"
@@ -92,11 +115,20 @@ DEFAULT_DOCUMENT_ONLY_PROMPT = "请先阅读我附上的文档，并按我的上
 DEFAULT_IMAGE_AND_DOCUMENT_ONLY_PROMPT = "请查看我附上的图片并阅读我附上的文档，然后按我的上下文继续处理。"
 SUPPORTED_DOCUMENT_ATTACHMENT_HINT = "txt/md/json/yaml/csv/pdf/docx/jl/ipynb 等文档类附件"
 DEFAULT_PROGRESS_UPDATES_ENABLED = True
+DEFAULT_SLACK_STARTUP_RETRY_INITIAL_SECONDS = 2.0
+DEFAULT_SLACK_STARTUP_RETRY_MAX_SECONDS = 60.0
 
 
 def normalize_reasoning_effort(value):
     normalized = str(value or "").strip().lower()
     if normalized in SUPPORTED_REASONING_EFFORTS:
+        return normalized
+    return None
+
+
+def normalize_collaboration_mode(value):
+    normalized = str(value or "").strip().lower()
+    if normalized in SUPPORTED_COLLABORATION_MODES:
         return normalized
     return None
 
@@ -151,13 +183,13 @@ class SlackThreadSessionStore:
             if isinstance(value, str):
                 normalized[key] = {"session_id": value, "updated_at": 0}
                 continue
-            if not isinstance(value, dict) or not isinstance(value.get("session_id"), str):
+            if not isinstance(value, dict):
                 continue
 
-            entry = {
-                "session_id": value["session_id"],
-                "updated_at": value.get("updated_at", 0),
-            }
+            entry = {"updated_at": value.get("updated_at", 0)}
+            session_id = str(value.get("session_id") or "").strip()
+            if session_id:
+                entry["session_id"] = session_id
             mode = value.get("mode")
             if mode in {SESSION_MODE_OBSERVE, SESSION_MODE_CONTROL}:
                 entry["mode"] = mode
@@ -176,8 +208,27 @@ class SlackThreadSessionStore:
             session_cwd = normalize_session_cwd(value.get("session_cwd"))
             if session_cwd:
                 entry["session_cwd"] = session_cwd
+            collaboration_mode = normalize_collaboration_mode(value.get("collaboration_mode"))
+            if collaboration_mode:
+                entry["collaboration_mode"] = collaboration_mode
+            if not self._has_persisted_state(entry):
+                continue
             normalized[key] = entry
         return normalized
+
+    @staticmethod
+    def _has_persisted_state(entry):
+        if not isinstance(entry, dict):
+            return False
+        return any(
+            [
+                bool(entry.get("session_id")),
+                bool(entry.get("owner_user_id")),
+                bool(entry.get("reasoning_effort")),
+                "progress_updates" in entry,
+                bool(entry.get("collaboration_mode")),
+            ]
+        )
 
     def _save_locked(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -253,6 +304,13 @@ class SlackThreadSessionStore:
                 return None
             return normalize_progress_updates(entry.get("progress_updates"))
 
+    def get_collaboration_mode(self, key):
+        with self._lock:
+            entry = self._sessions.get(key)
+            if not entry:
+                return None
+            return normalize_collaboration_mode(entry.get("collaboration_mode"))
+
     def find_owner_for_session(self, session_id):
         with self._lock:
             for entry in self._sessions.values():
@@ -280,6 +338,9 @@ class SlackThreadSessionStore:
             progress_updates = normalize_progress_updates(existing_entry.get("progress_updates"))
             if progress_updates is not None:
                 entry["progress_updates"] = progress_updates
+            collaboration_mode = normalize_collaboration_mode(existing_entry.get("collaboration_mode"))
+            if collaboration_mode:
+                entry["collaboration_mode"] = collaboration_mode
             effective_session_origin = session_origin or existing_entry.get("session_origin") or SESSION_ORIGIN_SLACK
             if effective_session_origin in {SESSION_ORIGIN_ATTACHED, SESSION_ORIGIN_SLACK}:
                 entry["session_origin"] = effective_session_origin
@@ -337,6 +398,9 @@ class SlackThreadSessionStore:
             progress_updates = normalize_progress_updates(existing_entry.get("progress_updates"))
             if progress_updates is not None:
                 entry["progress_updates"] = progress_updates
+            collaboration_mode = normalize_collaboration_mode(existing_entry.get("collaboration_mode"))
+            if collaboration_mode:
+                entry["collaboration_mode"] = collaboration_mode
             effective_session_cwd = normalize_session_cwd(session_cwd) or normalize_session_cwd(
                 existing_entry.get("session_cwd")
             )
@@ -368,7 +432,7 @@ class SlackThreadSessionStore:
             if "reasoning_effort" not in entry:
                 return False
             entry.pop("reasoning_effort", None)
-            if entry.get("session_id"):
+            if self._has_persisted_state(entry):
                 entry["updated_at"] = int(time.time())
                 self._save_locked()
                 return True
@@ -398,13 +462,27 @@ class SlackThreadSessionStore:
             if "progress_updates" not in entry:
                 return False
             entry.pop("progress_updates", None)
-            if entry.get("session_id") or entry.get("reasoning_effort") or entry.get("owner_user_id"):
+            if self._has_persisted_state(entry):
                 entry["updated_at"] = int(time.time())
                 self._save_locked()
                 return True
             self._sessions.pop(key, None)
             self._save_locked()
             return True
+
+    def set_collaboration_mode(self, key, collaboration_mode, owner_user_id=None):
+        normalized_mode = normalize_collaboration_mode(collaboration_mode)
+        if not normalized_mode:
+            return
+        with self._lock:
+            existing_entry = dict(self._sessions.get(key, {}))
+            existing_entry["collaboration_mode"] = normalized_mode
+            existing_entry["updated_at"] = int(time.time())
+            effective_owner_user_id = owner_user_id or existing_entry.get("owner_user_id")
+            if effective_owner_user_id:
+                existing_entry["owner_user_id"] = effective_owner_user_id
+            self._sessions[key] = existing_entry
+            self._save_locked()
 
     def set_session_cwd(self, key, session_cwd, owner_user_id=None):
         normalized_cwd = normalize_session_cwd(session_cwd)
@@ -447,7 +525,7 @@ class SlackThreadSessionStore:
             entry.pop("session_origin", None)
             entry.pop("session_cwd", None)
             entry["updated_at"] = int(time.time())
-            if entry.get("reasoning_effort") or entry.get("owner_user_id"):
+            if self._has_persisted_state(entry):
                 self._save_locked()
                 return
             self._sessions.pop(key, None)
@@ -509,6 +587,24 @@ class WatchThreadSnapshot:
     path: Optional[str]
     updated_at: Optional[int]
     status_type: str
+
+
+@dataclass
+class PendingSlackUserInputRequest:
+    token: str
+    thread_key: str
+    channel: str
+    thread_ts: str
+    owner_user_id: str
+    session_id: Optional[str]
+    request: RuntimeUserInputRequest
+    future: concurrent.futures.Future
+    prompt_message_ts: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+
+
+PENDING_USER_INPUT_REQUESTS = {}
+PENDING_USER_INPUT_REQUESTS_GUARD = threading.Lock()
 
 
 class AsyncProgressReporter:
@@ -604,7 +700,7 @@ truncate_text = thread_views.truncate_text
 def chunk_text(text, max_length=3500):
     normalized = (text or "").strip()
     if not normalized:
-        return ["Codex returned an empty response."]
+        return ["这一轮没有可发送的文本内容。"]
 
     chunks = []
     start = 0
@@ -644,6 +740,11 @@ def is_session_command(text):
 def is_status_command(text):
     normalized = (text or "").strip().lower()
     return normalized in {"/where", "where", "/whoami", "whoami", "/status", "status"}
+
+
+def is_mode_command(text):
+    normalized = (text or "").strip().lower()
+    return normalized in {"/mode", "mode", "collaboration mode", "/collaboration-mode"}
 
 
 def is_handoff_command(text):
@@ -817,6 +918,76 @@ def get_app_server_stdio_line_limit_bytes():
     return max(1024 * 1024, value)
 
 
+def get_app_server_request_timeout_seconds():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_APP_SERVER_REQUEST_TIMEOUT_SECONDS",
+            thread_views.DEFAULT_APP_SERVER_REQUEST_TIMEOUT_SECONDS,
+        )
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return thread_views.DEFAULT_APP_SERVER_REQUEST_TIMEOUT_SECONDS
+    return max(5.0, value)
+
+
+def get_app_server_resume_timeout_seconds():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_APP_SERVER_RESUME_TIMEOUT_SECONDS",
+            get_app_server_request_timeout_seconds(),
+        )
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return get_app_server_request_timeout_seconds()
+    return max(5.0, value)
+
+
+def get_app_server_resume_max_retries():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_APP_SERVER_RESUME_MAX_RETRIES",
+            DEFAULT_APP_SERVER_RESUME_MAX_RETRIES,
+        )
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_APP_SERVER_RESUME_MAX_RETRIES
+    return max(1, value)
+
+
+def get_slack_startup_retry_initial_seconds():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_STARTUP_RETRY_INITIAL_SECONDS",
+            DEFAULT_SLACK_STARTUP_RETRY_INITIAL_SECONDS,
+        )
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_SLACK_STARTUP_RETRY_INITIAL_SECONDS
+    return max(0.5, value)
+
+
+def get_slack_startup_retry_max_seconds():
+    raw = str(
+        ENV.get(
+            "CODEX_SLACK_STARTUP_RETRY_MAX_SECONDS",
+            DEFAULT_SLACK_STARTUP_RETRY_MAX_SECONDS,
+        )
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_SLACK_STARTUP_RETRY_MAX_SECONDS
+    return max(get_slack_startup_retry_initial_seconds(), value)
+
+
 def get_codex_app_server_config():
     codex_bin, _model, workdir, _timeout, _sandbox, _extra_args, _full_auto = get_codex_settings()
     return thread_views.CodexAppServerConfig(
@@ -824,7 +995,10 @@ def get_codex_app_server_config():
         workdir=workdir,
         env=build_codex_child_env(),
         line_limit_bytes=get_app_server_stdio_line_limit_bytes(),
+        request_timeout=get_app_server_request_timeout_seconds(),
+        resume_request_timeout=get_app_server_resume_timeout_seconds(),
         max_retries=MAX_APP_SERVER_RETRIES,
+        resume_max_retries=get_app_server_resume_max_retries(),
     )
 
 
@@ -835,6 +1009,62 @@ def get_app_runtime():
             APP_RUNTIME = AppServerRuntime(get_codex_app_server_config)
             atexit.register(APP_RUNTIME.close)
         return APP_RUNTIME
+
+
+def should_reset_runtime_after_exception(exc):
+    return isinstance(exc, (CodexTimeoutError, CodexTransportError))
+
+
+def compact_exception_text(exc, max_length=280):
+    text = " ".join(str(exc or "").split()).replace("`", "'").strip()
+    if not text:
+        text = exc.__class__.__name__
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 14].rstrip() + "...<truncated>"
+
+
+def build_process_error_message(user_id, exc, diagnostics=None):
+    mention = f"<@{user_id}> " if user_id else ""
+    detail = compact_exception_text(exc)
+    if isinstance(exc, CodexTimeoutError):
+        if "thread/resume" in detail:
+            guidance = "我已重置内部 runtime。请直接在这个 Slack thread 再发一次相同消息重试。"
+        elif "turn/start" in detail:
+            guidance = "我已重置内部 runtime。请直接重试；如果持续失败，再发 `status` 查看当前绑定状态。"
+        else:
+            guidance = "我已重置内部 runtime。请直接重试这条请求。"
+    elif isinstance(exc, CodexTransportError):
+        guidance = "我已重置内部 runtime。请直接重试；如果仍失败，再检查 `codex app-server` 是否可正常启动。"
+    elif isinstance(exc, CodexProtocolError):
+        guidance = "这是 app-server 返回的协议级错误。请按这里的错误详情继续在 Slack 里发修复指令。"
+    else:
+        guidance = "服务仍在运行。你可以继续直接在这个 Slack thread 里发送下一条指令。"
+    diagnostics_text = str(diagnostics or "").strip()
+    diagnostics_block = ""
+    if diagnostics_text:
+        diagnostics_block = f"\n- app-server stderr tail:\n```text\n{diagnostics_text[:1800]}\n```"
+    return (
+        f"{mention}这次请求失败了，但服务仍在运行。\n\n"
+        f"- error: `{exc.__class__.__name__}`\n"
+        f"- detail: `{detail}`\n"
+        f"{diagnostics_block}\n"
+        f"- next: {guidance}"
+    )
+
+
+def build_empty_final_response_text(session_id=None):
+    session_hint = f" 当前 session: `{session_id}`。" if session_id else ""
+    return (
+        "这一轮已经结束，但 Codex 没有产出可直接展示的最终答复文本。"
+        f"{session_hint}\n\n"
+        "你可以继续在这个 Slack thread 发送下一条消息；如果需要确认当前绑定与模式，可发送 `status` 或 `mode`。"
+    )
+
+
+def response_contains_proposed_plan(text):
+    normalized = str(text or "")
+    return "<proposed_plan>" in normalized and "</proposed_plan>" in normalized
 
 
 def get_watch_poll_seconds():
@@ -1010,6 +1240,28 @@ def get_session_origin(thread_key, session_store=None):
 def get_session_cwd(thread_key, session_store=None):
     session_store = session_store or SESSION_STORE
     return session_store.get_session_cwd(thread_key)
+
+
+def resolve_collaboration_mode(thread_key, session_store=None):
+    session_store = session_store or SESSION_STORE
+    return session_store.get_collaboration_mode(thread_key) or COLLABORATION_MODE_DEFAULT
+
+
+def get_collaboration_mode_state_lines(thread_key, session_store=None):
+    session_store = session_store or SESSION_STORE
+    thread_mode = session_store.get_collaboration_mode(thread_key)
+    effective_mode = resolve_collaboration_mode(thread_key, session_store=session_store)
+    return [
+        f"- collaboration_mode_effective: `{effective_mode}`",
+        f"- collaboration_mode_thread_override: `{thread_mode or '-'}`",
+    ]
+
+
+def format_collaboration_mode_label(collaboration_mode):
+    normalized = normalize_collaboration_mode(collaboration_mode) or COLLABORATION_MODE_DEFAULT
+    if normalized == COLLABORATION_MODE_PLAN:
+        return "Plan"
+    return "Default"
 
 
 def extract_thread_cwd(thread_read_response):
@@ -1205,6 +1457,410 @@ def get_reasoning_effort_reset_message(thread_key, session_id=None, session_orig
         "已清除当前 Slack thread 的 reasoning effort override。\n\n"
         f"{fallback_text}"
     )
+
+
+def build_runtime_collaboration_mode_payload(collaboration_mode, reasoning_effort=None):
+    normalized_mode = normalize_collaboration_mode(collaboration_mode)
+    if not normalized_mode:
+        return None
+    _codex_bin, model, _default_workdir, _timeout, _sandbox, _extra_args, _full_auto = get_codex_settings()
+    payload = {
+        "mode": normalized_mode,
+        "settings": {
+            "model": model,
+            "reasoningEffort": normalize_reasoning_effort(reasoning_effort),
+            "developerInstructions": None,
+        },
+    }
+    return payload
+
+
+def encode_thread_collaboration_mode_value(thread_key, target_mode):
+    return json.dumps(
+        {
+            "thread_key": str(thread_key or "").strip(),
+            "target_mode": normalize_collaboration_mode(target_mode),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def decode_thread_collaboration_mode_value(raw_value):
+    payload = json.loads(str(raw_value or ""))
+    if not isinstance(payload, dict):
+        raise RuntimeError("collaboration mode payload invalid")
+    thread_key = str(payload.get("thread_key") or "").strip()
+    target_mode = normalize_collaboration_mode(payload.get("target_mode"))
+    if not thread_key or not target_mode:
+        raise RuntimeError("collaboration mode payload incomplete")
+    return thread_key, target_mode
+
+
+def build_thread_collaboration_mode_message(thread_key, session_id=None, collaboration_mode=None):
+    effective_mode = normalize_collaboration_mode(collaboration_mode) or resolve_collaboration_mode(thread_key)
+    intro = (
+        f"*Collaboration Mode*\nCurrent: `{format_collaboration_mode_label(effective_mode)}`"
+    )
+    if session_id:
+        intro += f"\nSession: `{session_id}`"
+    else:
+        intro += "\nThis applies to later Slack-owned turns in this thread."
+    blocks = [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": intro},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": THREAD_COLLABORATION_MODE_PLAN_ACTION,
+                    "text": {"type": "plain_text", "text": "Plan"},
+                    "style": "primary" if effective_mode == COLLABORATION_MODE_PLAN else None,
+                    "value": encode_thread_collaboration_mode_value(
+                        thread_key,
+                        COLLABORATION_MODE_PLAN,
+                    ),
+                },
+                {
+                    "type": "button",
+                    "action_id": THREAD_COLLABORATION_MODE_DEFAULT_ACTION,
+                    "text": {"type": "plain_text", "text": "Default"},
+                    "style": "primary" if effective_mode == COLLABORATION_MODE_DEFAULT else None,
+                    "value": encode_thread_collaboration_mode_value(
+                        thread_key,
+                        COLLABORATION_MODE_DEFAULT,
+                    ),
+                },
+            ],
+        },
+    ]
+    for element in blocks[1]["elements"]:
+        if element.get("style") is None:
+            element.pop("style", None)
+    return intro.replace("*", ""), blocks
+
+
+def post_thread_collaboration_mode_message(client, channel, thread_ts, thread_key, session_id=None):
+    text, blocks = build_thread_collaboration_mode_message(
+        thread_key,
+        session_id=session_id,
+        collaboration_mode=resolve_collaboration_mode(thread_key),
+    )
+    return client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=text,
+        blocks=blocks,
+    )
+
+
+def build_request_user_input_action_value(token):
+    return json.dumps(
+        {"token": str(token or "").strip()},
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def decode_request_user_input_action_value(raw_value):
+    payload = json.loads(str(raw_value or ""))
+    if not isinstance(payload, dict):
+        raise RuntimeError("request_user_input payload invalid")
+    token = str(payload.get("token") or "").strip()
+    if not token:
+        raise RuntimeError("request_user_input payload incomplete")
+    return token
+
+
+def register_pending_user_input_request(pending_request):
+    with PENDING_USER_INPUT_REQUESTS_GUARD:
+        PENDING_USER_INPUT_REQUESTS[pending_request.token] = pending_request
+
+
+def get_pending_user_input_request(token):
+    with PENDING_USER_INPUT_REQUESTS_GUARD:
+        return PENDING_USER_INPUT_REQUESTS.get(token)
+
+
+def pop_pending_user_input_request(token):
+    with PENDING_USER_INPUT_REQUESTS_GUARD:
+        return PENDING_USER_INPUT_REQUESTS.pop(token, None)
+
+
+def set_pending_user_input_prompt_message_ts(token, message_ts):
+    with PENDING_USER_INPUT_REQUESTS_GUARD:
+        pending = PENDING_USER_INPUT_REQUESTS.get(token)
+        if not pending:
+            return
+        pending.prompt_message_ts = str(message_ts or "").strip() or None
+
+
+def resolve_pending_user_input_request(token, response_payload):
+    pending = get_pending_user_input_request(token)
+    if not pending or pending.future.done():
+        return False
+    pending.future.set_result(response_payload)
+    return True
+
+
+def build_request_user_input_prompt_summary(question):
+    lines = [f"*{question.header}*", question.question]
+    if question.options:
+        option_labels = [option.label for option in question.options]
+        if question.is_other:
+            option_labels.append("Other")
+        lines.append("Options: " + " | ".join(option_labels))
+    return "\n".join(lines)
+
+
+def build_request_user_input_prompt_text(pending_request):
+    count = len(pending_request.request.questions)
+    header = f"Codex 需要你补充 {count} 个输入。"
+    lines = [header, ""]
+    for question in pending_request.request.questions:
+        lines.append(build_request_user_input_prompt_summary(question))
+        lines.append("")
+    lines.append("点击 `Respond` 打开填写面板；如果这轮不继续，也可以点 `Cancel`。")
+    return "\n".join(lines).strip()
+
+
+def build_request_user_input_prompt_blocks(pending_request):
+    summary = "\n\n".join(
+        build_request_user_input_prompt_summary(question)
+        for question in pending_request.request.questions
+    ).strip()
+    summary_text = summary or "Codex 正在等待你的补充输入。"
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": summary_text},
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "action_id": REQUEST_USER_INPUT_OPEN_ACTION,
+                    "text": {"type": "plain_text", "text": "Respond"},
+                    "style": "primary",
+                    "value": build_request_user_input_action_value(pending_request.token),
+                },
+                {
+                    "type": "button",
+                    "action_id": REQUEST_USER_INPUT_CANCEL_ACTION,
+                    "text": {"type": "plain_text", "text": "Cancel"},
+                    "value": build_request_user_input_action_value(pending_request.token),
+                },
+            ],
+        },
+    ]
+
+
+def get_request_user_input_choice_block_id(index):
+    return f"rui_choice_{index}"
+
+
+def get_request_user_input_other_block_id(index):
+    return f"rui_other_{index}"
+
+
+def get_request_user_input_text_block_id(index):
+    return f"rui_text_{index}"
+
+
+def build_request_user_input_modal(pending_request):
+    blocks = []
+    for index, question in enumerate(pending_request.request.questions):
+        if question.options:
+            option_entries = [
+                {
+                    "text": {"type": "plain_text", "text": option.label[:75]},
+                    "description": {"type": "plain_text", "text": option.description[:75]},
+                    "value": str(option_index),
+                }
+                for option_index, option in enumerate(question.options)
+            ]
+            if question.is_other:
+                option_entries.append(
+                    {
+                        "text": {"type": "plain_text", "text": "Other"},
+                        "description": {
+                            "type": "plain_text",
+                            "text": "Provide a custom response.",
+                        },
+                        "value": REQUEST_USER_INPUT_OTHER_VALUE,
+                    }
+                )
+            blocks.append(
+                {
+                    "type": "input",
+                    "block_id": get_request_user_input_choice_block_id(index),
+                    "label": {"type": "plain_text", "text": question.header[:2000]},
+                    "element": {
+                        "type": "radio_buttons",
+                        "action_id": "choice",
+                        "options": option_entries,
+                    },
+                    "hint": {"type": "plain_text", "text": question.question[:2000]},
+                }
+            )
+            if question.is_other:
+                blocks.append(
+                    {
+                        "type": "input",
+                        "block_id": get_request_user_input_other_block_id(index),
+                        "optional": True,
+                        "label": {"type": "plain_text", "text": f"{question.header[:120]} (Other)"},
+                        "element": {
+                            "type": "plain_text_input",
+                            "action_id": "other_text",
+                            "multiline": False,
+                        },
+                    }
+                )
+            continue
+
+        blocks.append(
+            {
+                "type": "input",
+                "block_id": get_request_user_input_text_block_id(index),
+                "label": {"type": "plain_text", "text": question.header[:2000]},
+                "element": {
+                    "type": "plain_text_input",
+                    "action_id": "answer",
+                    "multiline": False,
+                },
+                "hint": {"type": "plain_text", "text": question.question[:2000]},
+            }
+        )
+
+    return {
+        "type": "modal",
+        "callback_id": REQUEST_USER_INPUT_SUBMIT_CALLBACK,
+        "private_metadata": build_request_user_input_action_value(pending_request.token),
+        "title": {"type": "plain_text", "text": "Codex Input"},
+        "submit": {"type": "plain_text", "text": "Send"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": blocks,
+    }
+
+
+def extract_view_selected_option_value(view_state, block_id, action_id):
+    values = ((view_state or {}).get("values") or {})
+    block = values.get(block_id) or {}
+    action = block.get(action_id) or {}
+    selected_option = action.get("selected_option") or {}
+    return str(selected_option.get("value") or "").strip()
+
+
+def extract_request_user_input_submission(view_state, pending_request):
+    errors = {}
+    answers = {}
+
+    for index, question in enumerate(pending_request.request.questions):
+        if question.options:
+            selected_value = extract_view_selected_option_value(
+                view_state,
+                get_request_user_input_choice_block_id(index),
+                "choice",
+            )
+            if not selected_value:
+                errors[get_request_user_input_choice_block_id(index)] = "请选择一个选项。"
+                continue
+            if selected_value == REQUEST_USER_INPUT_OTHER_VALUE:
+                other_text = extract_view_state_value(
+                    view_state,
+                    get_request_user_input_other_block_id(index),
+                    "other_text",
+                )
+                if not other_text:
+                    errors[get_request_user_input_other_block_id(index)] = "请填写 Other 的内容。"
+                    continue
+                answers[question.id] = {"answers": [other_text]}
+                continue
+            try:
+                selected_index = int(selected_value)
+                selected_option = question.options[selected_index]
+            except (IndexError, TypeError, ValueError):
+                errors[get_request_user_input_choice_block_id(index)] = "选项已失效，请重新选择。"
+                continue
+            answers[question.id] = {"answers": [selected_option.label]}
+            continue
+
+        text_value = extract_view_state_value(
+            view_state,
+            get_request_user_input_text_block_id(index),
+            "answer",
+        )
+        if not text_value:
+            errors[get_request_user_input_text_block_id(index)] = "请填写回答内容。"
+            continue
+        answers[question.id] = {"answers": [text_value]}
+
+    return {"answers": answers}, errors
+
+
+def update_request_user_input_prompt_message(client, pending_request, status_text):
+    if not pending_request.prompt_message_ts:
+        return
+    with suppress(Exception):
+        client.chat_update(
+            channel=pending_request.channel,
+            ts=pending_request.prompt_message_ts,
+            text=status_text,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": status_text},
+                }
+            ],
+        )
+
+
+async def prompt_slack_user_input_async(
+    client,
+    channel,
+    thread_ts,
+    thread_key,
+    user_id,
+    session_id,
+    request,
+):
+    token = uuid.uuid4().hex
+    pending_request = PendingSlackUserInputRequest(
+        token=token,
+        thread_key=thread_key,
+        channel=channel,
+        thread_ts=thread_ts,
+        owner_user_id=user_id,
+        session_id=session_id,
+        request=request,
+        future=concurrent.futures.Future(),
+    )
+    register_pending_user_input_request(pending_request)
+
+    try:
+        prompt_text = build_request_user_input_prompt_text(pending_request)
+        response = client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=prompt_text,
+            blocks=build_request_user_input_prompt_blocks(pending_request),
+        )
+        set_pending_user_input_prompt_message_ts(token, response.get("ts"))
+    except Exception:
+        pop_pending_user_input_request(token)
+        return {"answers": {}}
+
+    try:
+        return await asyncio.wrap_future(pending_request.future)
+    except Exception:
+        return {"answers": {}}
+    finally:
+        pop_pending_user_input_request(token)
 
 
 def parse_extra_arg_value(tokens, flag_name):
@@ -1686,7 +2342,7 @@ def run_codex(
         if timed_out:
             return CodexRunResult(
                 session_id=(session_id_tracker.get() if session_id_tracker else None) or session_id,
-                text=f"Codex timed out after {timeout} seconds.",
+                text=f"Codex 运行超时：已超过 {timeout} 秒。",
                 exit_code=None,
                 raw_output=raw_output,
                 final_output="",
@@ -1718,9 +2374,14 @@ def run_codex(
                 result_text = final_output
             else:
                 fallback_output = json_output or cleaned_output
-                result_text = f"Codex exited with status {exit_code}.\n\n{fallback_output}".strip()
+                result_text = f"Codex 进程异常退出，exit code={exit_code}。\n\n{fallback_output}".strip()
         else:
-            result_text = final_output or json_output or cleaned_output or "Codex finished without returning text."
+            result_text = (
+                final_output
+                or json_output
+                or cleaned_output
+                or build_empty_final_response_text(effective_session_id)
+            )
 
         return CodexRunResult(
             session_id=effective_session_id,
@@ -1989,12 +2650,17 @@ def run_runtime_turn_with_updates(
     image_paths=None,
     owner_user_id=None,
     session_origin=SESSION_ORIGIN_SLACK,
+    collaboration_mode=None,
 ):
     runtime = get_app_runtime()
     session_id_tracker = SessionIdTracker(session_id=session_id)
     heartbeat_seconds = get_progress_heartbeat_seconds() if enable_progress else None
     progress_state = {"baseline": {}}
     progress_reporter = create_progress_reporter(client, channel, thread_ts) if enable_progress else None
+    runtime_collaboration_mode = build_runtime_collaboration_mode_payload(
+        collaboration_mode,
+        reasoning_effort=reasoning_effort,
+    )
 
     def on_turn_started(started_session_id, turn_id):
         session_id_tracker.set(started_session_id)
@@ -2030,6 +2696,17 @@ def run_runtime_turn_with_updates(
             f" session `{current_session_id}`"
         )
 
+    async def on_user_input_request(request):
+        return await prompt_slack_user_input_async(
+            client,
+            channel,
+            thread_ts,
+            thread_key,
+            owner_user_id or "",
+            session_id_tracker.get() or session_id,
+            request,
+        )
+
     try:
         runtime_result = runtime.run_turn(
             session_id=session_id,
@@ -2039,10 +2716,12 @@ def run_runtime_turn_with_updates(
                 reasoning_effort=reasoning_effort,
                 workdir_override=workdir_override,
             ),
+            collaboration_mode=runtime_collaboration_mode,
             heartbeat_seconds=heartbeat_seconds,
             on_turn_started=on_turn_started,
             on_step=on_step,
             on_heartbeat=on_heartbeat,
+            on_user_input_request=on_user_input_request,
         )
     except Exception as exc:
         if session_id and is_invalid_session_result(str(exc)):
@@ -2064,7 +2743,9 @@ def run_runtime_turn_with_updates(
             progress_reporter.flush()
             progress_reporter.close()
 
-    final_text = (runtime_result.final_text or "").strip() or "Codex finished without returning text."
+    final_text = (runtime_result.final_text or "").strip() or build_empty_final_response_text(
+        session_id_tracker.get() or runtime_result.session_id
+    )
     raw_output = "\n\n".join(step.text for step in runtime_result.steps if step.text).strip()
     return CodexRunResult(
         session_id=session_id_tracker.get() or runtime_result.session_id,
@@ -2825,6 +3506,14 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         next_session_id=next_session_id,
                     )
                     post_chunks(client, channel, thread_ts, result)
+                    if response_contains_proposed_plan(result):
+                        post_thread_collaboration_mode_message(
+                            client,
+                            channel,
+                            thread_ts,
+                            thread_key,
+                            session_id=next_session_id or current_session_id,
+                        )
                     return
 
                 if is_recap_command(prompt):
@@ -2907,6 +3596,14 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         next_session_id=next_session_id,
                     )
                     post_chunks(client, channel, thread_ts, result)
+                    if response_contains_proposed_plan(result):
+                        post_thread_collaboration_mode_message(
+                            client,
+                            channel,
+                            thread_ts,
+                            thread_key,
+                            session_id=next_session_id or current_session_id,
+                        )
                     return
 
                 if is_recent_command(prompt):
@@ -3133,6 +3830,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                         session_id=current_session_id,
                         session_origin=current_session_origin,
                     )
+                    collaboration_lines = get_collaboration_mode_state_lines(thread_key)
                     progress_lines = get_progress_updates_state_lines(thread_key)
                     client.chat_postMessage(
                         channel=channel,
@@ -3154,10 +3852,22 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                             f"- watch_active: `{watch_active}`\n"
                             + "\n".join(reasoning_lines)
                             + "\n"
+                            + "\n".join(collaboration_lines)
+                            + "\n"
                             + "\n".join(progress_lines)
                             + "\n"
                             "如果你想让终端继续同一个会话，可以在终端里使用这个 `session_id` 执行 `codex exec resume ...`。"
                         ),
+                    )
+                    return
+
+                if is_mode_command(prompt):
+                    post_thread_collaboration_mode_message(
+                        client,
+                        channel,
+                        thread_ts,
+                        thread_key,
+                        session_id=current_session_id,
                     )
                     return
 
@@ -3324,6 +4034,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     session_id=existing_session_id,
                     session_cwd=runtime_session_cwd,
                 )
+                thread_collaboration_mode = resolve_collaboration_mode(thread_key)
                 reasoning_effort, _effort_source = resolve_reasoning_effort(
                     thread_key,
                     session_id=existing_session_id,
@@ -3387,6 +4098,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                                 image_paths=image_paths,
                                 owner_user_id=user_id,
                                 session_origin=run_session_origin,
+                                collaboration_mode=thread_collaboration_mode,
                             )
                         else:
                             codex_result = run_codex_with_updates(
@@ -3438,6 +4150,7 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                                     image_paths=image_paths,
                                     owner_user_id=user_id,
                                     session_origin=SESSION_ORIGIN_SLACK,
+                                    collaboration_mode=thread_collaboration_mode,
                                 )
                             else:
                                 codex_result = run_codex_with_updates(
@@ -3484,14 +4197,28 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     next_session_id=next_session_id,
                 )
                 post_chunks(client, channel, thread_ts, result)
+                if response_contains_proposed_plan(result):
+                    post_thread_collaboration_mode_message(
+                        client,
+                        channel,
+                        thread_ts,
+                        thread_key,
+                        session_id=next_session_id or existing_session_id,
+                    )
         finally:
             release_thread_lock(thread_key)
     except Exception as exc:
+        runtime_diagnostics = ""
+        if should_reset_runtime_after_exception(exc):
+            with suppress(Exception):
+                runtime = get_app_runtime()
+                runtime.reset()
+                runtime_diagnostics = runtime.last_client_diagnostics()
         try:
             client.chat_postMessage(
                 channel=channel,
                 thread_ts=thread_ts,
-                text=f"<@{user_id}> 处理这条请求时发生了内部错误，请稍后重试并检查服务日志。",
+                text=build_process_error_message(user_id, exc, diagnostics=runtime_diagnostics),
             )
         except Exception:
             pass
@@ -3501,7 +4228,8 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
             f" error={exc!r}",
             flush=True,
         )
-        raise
+        traceback.print_exc()
+        return
 
 
 def start_background_job(client, channel, thread_ts, prompt, user_id, slack_event_payload=None):
@@ -3599,6 +4327,21 @@ def extract_view_state_value(view_state, block_id, action_id):
     action = block.get(action_id) or {}
     value = str(action.get("value") or "").strip()
     return value
+
+
+def extract_action_channel_thread(body):
+    channel = body.get("channel", {}) or {}
+    container = body.get("container", {}) or {}
+    message = body.get("message", {}) or {}
+    channel_id = (
+        channel.get("id")
+        or container.get("channel_id")
+        or message.get("channel")
+        or ""
+    )
+    message_ts = container.get("message_ts") or message.get("ts") or ""
+    thread_ts = container.get("thread_ts") or message.get("thread_ts") or message_ts
+    return str(channel_id or ""), str(thread_ts or ""), str(message_ts or "")
 
 
 def get_thread_display_title(session_id):
@@ -3711,6 +4454,7 @@ def build_app():
     app = App(
         token=ENV["SLACK_BOT_TOKEN"],
         signing_secret=ENV.get("SLACK_SIGNING_SECRET", ""),
+        token_verification_enabled=False,
     )
 
     @app.use
@@ -3830,6 +4574,180 @@ def build_app():
         except Exception as exc:  # pragma: no cover
             logger.exception("Failed submitting binding rename for %s: %r", user_id, exc)
 
+    @app.action(THREAD_COLLABORATION_MODE_PLAN_ACTION)
+    @app.action(THREAD_COLLABORATION_MODE_DEFAULT_ACTION)
+    def handle_thread_collaboration_mode_set(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected collaboration mode action from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            thread_key, target_mode = decode_thread_collaboration_mode_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid collaboration mode payload from %s: %r", user_id, exc)
+            return
+        if get_thread_owner_access_error(thread_key, user_id):
+            logger.warning(
+                "Rejected collaboration mode action for non-owner user %s thread %s",
+                user_id,
+                thread_key,
+            )
+            return
+        SESSION_STORE.set_collaboration_mode(thread_key, target_mode, owner_user_id=user_id)
+        session_id = SESSION_STORE.get(thread_key)
+        channel_id, thread_ts, message_ts = extract_action_channel_thread(body)
+        text, blocks = build_thread_collaboration_mode_message(
+            thread_key,
+            session_id=session_id,
+            collaboration_mode=target_mode,
+        )
+        try:
+            if channel_id and message_ts:
+                client.chat_update(
+                    channel=channel_id,
+                    ts=message_ts,
+                    text=text,
+                    blocks=blocks,
+                )
+            elif channel_id and thread_ts:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text=text,
+                    blocks=blocks,
+                )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed updating collaboration mode card for %s: %r", user_id, exc)
+
+    @app.action(REQUEST_USER_INPUT_OPEN_ACTION)
+    def handle_request_user_input_open(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected request_user_input open from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            token = decode_request_user_input_action_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid request_user_input open payload from %s: %r", user_id, exc)
+            return
+        pending_request = get_pending_user_input_request(token)
+        channel_id, thread_ts, _message_ts = extract_action_channel_thread(body)
+        if not pending_request:
+            if channel_id and thread_ts:
+                client.chat_postMessage(
+                    channel=channel_id,
+                    thread_ts=thread_ts,
+                    text="这次补充输入请求已经结束或失效了。",
+                )
+            return
+        if pending_request.owner_user_id and pending_request.owner_user_id != user_id:
+            logger.warning(
+                "Rejected request_user_input open for non-owner user %s token %s",
+                user_id,
+                token,
+            )
+            return
+        trigger_id = body.get("trigger_id", "")
+        if not trigger_id:
+            return
+        try:
+            client.views_open(
+                trigger_id=trigger_id,
+                view=build_request_user_input_modal(pending_request),
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed opening request_user_input modal for %s: %r", user_id, exc)
+
+    @app.action(REQUEST_USER_INPUT_CANCEL_ACTION)
+    def handle_request_user_input_cancel(ack, body, client, logger):
+        ack()
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected request_user_input cancel from unauthorized user %s", user_id)
+            return
+        actions = body.get("actions", []) or []
+        action = actions[0] if actions else {}
+        try:
+            token = decode_request_user_input_action_value(action.get("value"))
+        except Exception as exc:
+            logger.exception("Invalid request_user_input cancel payload from %s: %r", user_id, exc)
+            return
+        pending_request = get_pending_user_input_request(token)
+        if not pending_request:
+            return
+        if pending_request.owner_user_id and pending_request.owner_user_id != user_id:
+            logger.warning(
+                "Rejected request_user_input cancel for non-owner user %s token %s",
+                user_id,
+                token,
+            )
+            return
+        if resolve_pending_user_input_request(token, {"answers": {}}):
+            update_request_user_input_prompt_message(
+                client,
+                pending_request,
+                "这次补充输入已取消，Codex 会继续按空回答处理。",
+            )
+
+    @app.view(REQUEST_USER_INPUT_SUBMIT_CALLBACK)
+    def handle_request_user_input_submit(ack, body, view, client, logger):
+        user = body.get("user", {}) or {}
+        user_id = user.get("id", "")
+        if not user_id:
+            ack()
+            return
+        if not is_allowed_slack_user(user_id):
+            logger.warning("Rejected request_user_input submit from unauthorized user %s", user_id)
+            ack()
+            return
+        try:
+            token = decode_request_user_input_action_value(view.get("private_metadata"))
+        except Exception as exc:
+            logger.exception("Invalid request_user_input submit payload from %s: %r", user_id, exc)
+            ack()
+            return
+        pending_request = get_pending_user_input_request(token)
+        if not pending_request:
+            ack()
+            return
+        if pending_request.owner_user_id and pending_request.owner_user_id != user_id:
+            logger.warning(
+                "Rejected request_user_input submit for non-owner user %s token %s",
+                user_id,
+                token,
+            )
+            ack()
+            return
+        response_payload, errors = extract_request_user_input_submission(
+            view.get("state"),
+            pending_request,
+        )
+        if errors:
+            ack(response_action="errors", errors=errors)
+            return
+        ack()
+        if resolve_pending_user_input_request(token, response_payload):
+            update_request_user_input_prompt_message(
+                client,
+                pending_request,
+                "已收到你的补充输入，Codex 正在继续。",
+            )
+
     @app.event("app_mention")
     def handle_app_mention(body, client, logger):
         event = body.get("event", {})
@@ -3878,6 +4796,73 @@ def build_app():
         start_background_job(client, channel, thread_ts, prompt, user_id, slack_event_payload=body)
 
     return app
+
+
+def is_retryable_slack_startup_error(exc):
+    current = exc
+    visited = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, (urllib.error.URLError, ssl.SSLError, socket.gaierror, TimeoutError)):
+            return True
+        if isinstance(current, ConnectionError):
+            return True
+        if isinstance(current, SlackApiError):
+            response = getattr(current, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code in {429, 500, 502, 503, 504}:
+                return True
+            error_code = ""
+            if response is not None:
+                with suppress(Exception):
+                    error_code = str(response.get("error") or "").strip().lower()
+            if error_code in {
+                "ratelimited",
+                "internal_error",
+                "fatal_error",
+                "request_timeout",
+                "service_unavailable",
+            }:
+                return True
+            return False
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def format_startup_exception(exc):
+    return compact_exception_text(exc, max_length=500)
+
+
+def run_socket_mode_forever(
+    *,
+    app_factory=build_app,
+    handler_factory=SocketModeHandler,
+    sleep_fn=time.sleep,
+):
+    attempt = 0
+    delay_seconds = get_slack_startup_retry_initial_seconds()
+    max_delay_seconds = get_slack_startup_retry_max_seconds()
+    while True:
+        attempt += 1
+        try:
+            app = app_factory()
+            handler = handler_factory(app, ENV["SLACK_APP_TOKEN"])
+            handler.start()
+            return
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            if not is_retryable_slack_startup_error(exc):
+                raise
+            print(
+                "[slack_startup_retry]"
+                f" attempt={attempt}"
+                f" delay_seconds={delay_seconds:.1f}"
+                f" error={format_startup_exception(exc)}",
+                flush=True,
+            )
+            sleep_fn(delay_seconds)
+            delay_seconds = min(max_delay_seconds, delay_seconds * 2)
 
 
 def log_session_event(event, thread_key, existing_session_id=None, next_session_id=None):
@@ -3965,9 +4950,7 @@ def main():
     validate_env()
     INSTANCE_LOCK_HANDLE = acquire_instance_lock()
     atexit.register(release_instance_lock)
-    app = build_app()
-    handler = SocketModeHandler(app, ENV["SLACK_APP_TOKEN"])
-    handler.start()
+    run_socket_mode_forever()
 
 
 if __name__ == "__main__":

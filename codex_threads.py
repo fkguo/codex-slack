@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -14,6 +15,8 @@ except ImportError as exc:  # pragma: no cover
 
 
 DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES = 32 * 1024 * 1024
+DEFAULT_APP_SERVER_REQUEST_TIMEOUT_SECONDS = 90.0
+DEFAULT_APP_SERVER_STDERR_TAIL_LINES = 80
 
 
 @dataclass(frozen=True)
@@ -23,7 +26,11 @@ class CodexAppServerConfig:
     env: dict[str, str]
     line_limit_bytes: int = DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES
     connect_timeout: float = 30.0
+    request_timeout: float = DEFAULT_APP_SERVER_REQUEST_TIMEOUT_SECONDS
+    resume_request_timeout: float = DEFAULT_APP_SERVER_REQUEST_TIMEOUT_SECONDS
     max_retries: int = 2
+    resume_max_retries: int = 2
+    stderr_tail_lines: int = DEFAULT_APP_SERVER_STDERR_TAIL_LINES
 
 
 @dataclass(frozen=True)
@@ -61,7 +68,16 @@ class WatchAnchorLostError(RuntimeError):
 class LargePayloadStdioTransport(StdioTransport):
     """SDK stdio transport with a larger stdout line limit for huge thread/read payloads."""
 
-    def __init__(self, command, *, cwd=None, env=None, connect_timeout=30.0, line_limit_bytes=None):
+    def __init__(
+        self,
+        command,
+        *,
+        cwd=None,
+        env=None,
+        connect_timeout=30.0,
+        line_limit_bytes=None,
+        stderr_tail_lines=None,
+    ):
         super().__init__(
             command,
             cwd=cwd,
@@ -69,6 +85,10 @@ class LargePayloadStdioTransport(StdioTransport):
             connect_timeout=connect_timeout,
         )
         self._line_limit_bytes = int(line_limit_bytes or DEFAULT_APP_SERVER_STDIO_LINE_LIMIT_BYTES)
+        self._stderr_tail = deque(
+            maxlen=max(1, int(stderr_tail_lines or DEFAULT_APP_SERVER_STDERR_TAIL_LINES))
+        )
+        self._stderr_task = None
 
     async def connect(self) -> None:
         if self._proc is not None:
@@ -79,7 +99,7 @@ class LargePayloadStdioTransport(StdioTransport):
                     *self._command,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
                     cwd=self._cwd,
                     env=self._env,
                     limit=self._line_limit_bytes,
@@ -90,6 +110,37 @@ class LargePayloadStdioTransport(StdioTransport):
             raise CodexTransportError(
                 f"failed to start stdio transport command: {self._command!r}"
             ) from exc
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    async def _drain_stderr(self):
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    self._stderr_tail.append(text)
+        except Exception:
+            return
+
+    def stderr_tail_text(self, max_lines=20):
+        if not self._stderr_tail:
+            return ""
+        tail = list(self._stderr_tail)[-max(1, int(max_lines)) :]
+        return "\n".join(tail).strip()
+
+    async def close(self) -> None:
+        stderr_task = self._stderr_task
+        self._stderr_task = None
+        await super().close()
+        if stderr_task is not None:
+            stderr_task.cancel()
+            with suppress(Exception):
+                await stderr_task
 
 
 def normalize_session_cwd(value):
@@ -125,14 +176,47 @@ def create_app_server_client(config: CodexAppServerConfig):
         env=config.env,
         line_limit_bytes=config.line_limit_bytes,
         connect_timeout=config.connect_timeout,
+        stderr_tail_lines=config.stderr_tail_lines,
     )
-    return CodexClient(transport)
+    client = CodexClient(transport, request_timeout=config.request_timeout)
+    client._codex_slack_transport = transport
+    return client
+
+
+def get_client_stderr_tail(client, max_lines=20):
+    client_dict = getattr(client, "__dict__", None)
+    transport = None
+    if isinstance(client_dict, dict):
+        transport = client_dict.get("_codex_slack_transport")
+        if transport is None:
+            transport = client_dict.get("_transport")
+    if transport is None or not hasattr(transport, "stderr_tail_text"):
+        return ""
+    try:
+        return transport.stderr_tail_text(max_lines=max_lines)
+    except Exception:
+        return ""
+
+
+def build_initialize_params():
+    return {
+        "capabilities": {
+            "experimentalApi": True,
+        }
+    }
+
+
+async def initialize_app_server_client(client, config: CodexAppServerConfig):
+    return await client.initialize(
+        params=build_initialize_params(),
+        timeout=config.request_timeout,
+    )
 
 
 async def read_thread_response_async(config: CodexAppServerConfig, session_id, *, include_turns=True):
     client = create_app_server_client(config)
     await client.start()
-    await client.initialize()
+    await initialize_app_server_client(client, config)
     try:
         return await client.read_thread(session_id, include_turns=include_turns)
     finally:
@@ -168,7 +252,7 @@ async def list_threads_async(
 ):
     client = create_app_server_client(config)
     await client.start()
-    await client.initialize()
+    await initialize_app_server_client(client, config)
     try:
         return await client.list_threads(
             archived=archived,
@@ -215,7 +299,7 @@ def list_threads(
 async def set_thread_name_async(config: CodexAppServerConfig, session_id, name):
     client = create_app_server_client(config)
     await client.start()
-    await client.initialize()
+    await initialize_app_server_client(client, config)
     try:
         return await client.set_thread_name(session_id, name)
     finally:
@@ -253,7 +337,7 @@ def rename_thread(config: CodexAppServerConfig, session_id, title):
 async def interrupt_turn_async(config: CodexAppServerConfig, thread_id, turn_id):
     client = create_app_server_client(config)
     await client.start()
-    await client.initialize()
+    await initialize_app_server_client(client, config)
     try:
         return await client.request(
             "turn/interrupt",
@@ -280,7 +364,7 @@ def interrupt_turn(config: CodexAppServerConfig, thread_id, turn_id):
 async def steer_turn_async(config: CodexAppServerConfig, thread_id, expected_turn_id, input_items):
     client = create_app_server_client(config)
     await client.start()
-    await client.initialize()
+    await initialize_app_server_client(client, config)
     try:
         return await client.steer_turn(
             thread_id=thread_id,

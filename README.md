@@ -16,10 +16,12 @@
 - `recent` / `sessions` 可查看最近的 Codex sessions，并支持 `attach recent <n>`
 - `attach` 后默认进入 `observe` 模式，避免和终端里的交互式 Codex 并发写入
 - 只有切到 `control` / `takeover` 模式后，Slack 普通消息才会继续 `resume` 当前 session
+- 当前 Slack thread 可通过 `mode` 命令显示按钮，切换后续 Slack 接管 turn 的 collaboration mode：`Plan` / `Default`
 - 支持把 Slack 消息里的图片附件和文档类附件传给 Codex
 - `watch` 会先回放最近一轮已完成的可显示对话，然后在 thread 对话发生变化时持续推送后续新增的用户消息和 `final_answer`
 - `name <title>` 可重命名当前 session
 - `interrupt` / `steer <text>` 可控制当前由 `codex-slack` 接管并持有的活跃 turn
+- 如果 Codex 在运行中调用 `request_user_input`，Slack thread 会出现 `Respond` / `Cancel` 入口；`Respond` 会打开一个填写面板
 - 默认会推送自然语言中间 `Codex Progress`，并做短时间节流合并；可按 Slack thread 用 `progress on|off|reset|status` 控制
 - 支持按 Slack thread 设置 reasoning effort：`effort <level>`、`effort reset`、`fresh --effort <level> ...`
 - App Home 会显示默认配置、你自己的 Slack thread 绑定和最近 sessions
@@ -73,6 +75,9 @@ CODEX_PROGRESS_HEARTBEAT_SECONDS=300
 CODEX_PROGRESS_POLL_SECONDS=15
 CODEX_PROGRESS_BATCH_SECONDS=5
 # CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES=33554432
+# CODEX_SLACK_APP_SERVER_REQUEST_TIMEOUT_SECONDS=90
+# CODEX_SLACK_APP_SERVER_RESUME_TIMEOUT_SECONDS=120
+# CODEX_SLACK_APP_SERVER_RESUME_MAX_RETRIES=2
 ```
 
 说明：
@@ -96,6 +101,10 @@ CODEX_PROGRESS_BATCH_SECONDS=5
 - `CODEX_PROGRESS_POLL_SECONDS` 控制长任务 progress 轮询间隔，默认 15 秒
 - `CODEX_PROGRESS_BATCH_SECONDS` 控制 progress 在发往 Slack 前的短时间合并窗口，默认 5 秒
 - `CODEX_SLACK_APP_SERVER_LINE_LIMIT_BYTES` 可选，用于在 thread 很长时提高 app-server `thread/read` 的 stdio 行缓冲上限
+- `CODEX_SLACK_APP_SERVER_REQUEST_TIMEOUT_SECONDS` 控制 app-server 普通请求超时，默认 90 秒
+- `CODEX_SLACK_APP_SERVER_RESUME_TIMEOUT_SECONDS` 可单独放宽 `thread/resume` 超时；默认继承 `CODEX_SLACK_APP_SERVER_REQUEST_TIMEOUT_SECONDS`
+- `CODEX_SLACK_APP_SERVER_RESUME_MAX_RETRIES` 控制 `thread/resume` 超时或传输失败后的自动重试次数，默认 2
+- `CODEX_SLACK_STARTUP_RETRY_INITIAL_SECONDS` 和 `CODEX_SLACK_STARTUP_RETRY_MAX_SECONDS` 属于高级可选项；默认分别为 2 秒和 60 秒，通常不需要手动设置
 - 系统环境变量优先级高于 `.env`
 
 4. 先确认本机 `codex` 已登录可用
@@ -111,6 +120,8 @@ python3 server.py
 ```
 
 只保留一个 `server.py` 进程运行。当前实现会持有 `.codex-slack.pid` 锁文件；如果已经有一个实例在跑，第二个实例会直接退出。
+
+如果启动时刚好遇到网络抖动、SSL EOF、Slack API 暂时不可达等问题，服务会按指数退避自动重试启动，而不是直接退出。
 
 ## Slack 配置
 
@@ -191,6 +202,7 @@ python3 server.py
 - `effort <low|medium|high|xhigh>`：设置当前 Slack thread 后续由 Slack 发起 turns 的 effort
 - `effort reset`：清除当前 Slack thread 的 effort override
 - `where` / `whoami` / `status`：查看当前 thread 的绑定状态
+- `mode`：显示当前 Slack thread 的 `Collaboration Mode` 卡片，可直接点 `Plan` / `Default`
 - `watch`：显示最近一轮对话，并持续推送后续新增对话
 - `unwatch` / `stop watch`：停止持续 watch
 - `control` / `takeover`：切到 `control` 模式，允许 Slack 普通消息继续 `resume`；如果当前 thread 上有 `watch`，会自动停止以避免重复消息
@@ -220,6 +232,23 @@ python3 server.py
 - 如果当前 thread 是由 Slack 自己新建或自动重建出来的 session，则会使用 `CODEX_REASONING_EFFORT`；如果 `.env` 里没配，默认是 `xhigh`
 - `fresh --effort high <prompt>` 等价于“先设置当前 thread 的 override，再立即用这个 effort 新开一次会话”
 - `status` / `where` / `whoami` 会显示当前 thread 的 effort 状态，包括 thread override、`.env` 默认值，以及当前生效来源
+
+## Collaboration Mode
+
+- 每个 Slack thread 都有一个独立的 collaboration mode 设置，当前支持 `Default` 和 `Plan`
+- 这个设置作用于“后续由 Slack 接管后启动的 turn”
+- `Default` 适合直接推进任务；`Plan` 更适合先整理步骤、方案和风险，再继续执行
+- 发送 `mode` 可在当前 thread 里重新显示 `Plan` / `Default` 按钮卡片
+- 如果某一轮回复里包含完整的 `<proposed_plan>...</proposed_plan>`，结果发完后会自动附带这个按钮卡片，方便你继续切换模式
+- 如果当前只是 `watch` 终端里已经在运行的一轮，切换 `Plan` / `Default` 不会改写那一轮；它会在下一轮由 Slack 接管后生效
+
+## `request_user_input`
+
+- 当 Codex 在 turn 里调用 `request_user_input` 时，Slack thread 会发出一条等待输入的消息
+- 点击 `Respond` 会打开一个 modal，用来填写或选择答案
+- 点击 `Cancel` 会向 Codex 返回空回答，让当前 turn 继续自行处理
+- 这套交互只对由 `codex-slack` runtime 持有的 turn 生效
+- 如果当前只是旁路 `watch` 一个终端里已经在运行的 turn，Slack 不会在中途接管并弹出这个输入面板
 
 ## `attach` 和 `watch`
 

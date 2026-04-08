@@ -1,12 +1,17 @@
+import concurrent.futures
 import os
+import ssl
 import tempfile
 import time
+import urllib.error
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import server
+from app_runtime import RuntimeUserInputQuestionOption
+from codex_app_server_sdk.errors import CodexTimeoutError
 
 
 def ns(**kwargs):
@@ -48,10 +53,20 @@ def make_thread_response(*turns):
 class DummyClient:
     def __init__(self):
         self.messages = []
+        self.updated_messages = []
+        self.opened_views = []
 
     def chat_postMessage(self, **kwargs):
         self.messages.append(kwargs)
         return {"ok": True, "ts": str(len(self.messages))}
+
+    def chat_update(self, **kwargs):
+        self.updated_messages.append(kwargs)
+        return {"ok": True}
+
+    def views_open(self, **kwargs):
+        self.opened_views.append(kwargs)
+        return {"ok": True}
 
 
 class CommandParsingTests(unittest.TestCase):
@@ -71,6 +86,7 @@ class CommandParsingTests(unittest.TestCase):
         self.assertTrue(server.is_progress_command("progress off"))
         self.assertEqual(server.strip_progress_command("/progress reset"), "reset")
         self.assertTrue(server.is_status_command("whoami"))
+        self.assertTrue(server.is_mode_command("mode"))
         self.assertTrue(server.is_session_command("session id"))
         self.assertTrue(server.is_watch_command("/watch"))
         self.assertFalse(server.is_watch_command("watch raw"))
@@ -133,6 +149,81 @@ class SessionModeResolutionTests(unittest.TestCase):
             )
         )
         self.assertIsNone(server.get_effective_session_mode("thread-1", session_id=None, session_mode=None))
+
+
+class AppServerConfigTests(unittest.TestCase):
+    def test_resume_timeout_defaults_to_request_timeout(self):
+        with patch.dict(server.ENV, {"CODEX_SLACK_APP_SERVER_REQUEST_TIMEOUT_SECONDS": "123"}, clear=False):
+            self.assertEqual(server.get_app_server_resume_timeout_seconds(), 123.0)
+
+    def test_resume_timeout_and_retry_budget_are_configurable(self):
+        with patch.dict(
+            server.ENV,
+            {
+                "CODEX_SLACK_APP_SERVER_REQUEST_TIMEOUT_SECONDS": "90",
+                "CODEX_SLACK_APP_SERVER_RESUME_TIMEOUT_SECONDS": "150",
+                "CODEX_SLACK_APP_SERVER_RESUME_MAX_RETRIES": "4",
+            },
+            clear=False,
+        ):
+            self.assertEqual(server.get_app_server_resume_timeout_seconds(), 150.0)
+            self.assertEqual(server.get_app_server_resume_max_retries(), 4)
+
+    def test_build_process_error_message_includes_runtime_diagnostics(self):
+        text = server.build_process_error_message(
+            "U123",
+            CodexTimeoutError("request timed out for method='thread/resume' after 90.0s"),
+            diagnostics="stderr line 1\nstderr line 2",
+        )
+        self.assertIn("CodexTimeoutError", text)
+        self.assertIn("thread/resume", text)
+        self.assertIn("stderr line 1", text)
+        self.assertIn("stderr line 2", text)
+
+    def test_retryable_slack_startup_error_accepts_ssl_eof(self):
+        err = urllib.error.URLError(ssl.SSLEOFError("EOF occurred in violation of protocol"))
+        self.assertTrue(server.is_retryable_slack_startup_error(err))
+
+    def test_retryable_slack_startup_error_rejects_programming_error(self):
+        self.assertFalse(server.is_retryable_slack_startup_error(ValueError("bad config")))
+
+    def test_run_socket_mode_forever_retries_retryable_startup_error(self):
+        events = []
+
+        def app_factory():
+            events.append("app")
+            if events.count("app") == 1:
+                raise urllib.error.URLError(
+                    ssl.SSLEOFError("EOF occurred in violation of protocol")
+                )
+            return "app-ok"
+
+        class FakeHandler:
+            def __init__(self, app, token):
+                events.append(("handler", app, token))
+
+            def start(self):
+                events.append("start")
+
+        sleeps = []
+        with patch.dict(
+            server.ENV,
+            {
+                "SLACK_APP_TOKEN": "xapp-test",
+                "CODEX_SLACK_STARTUP_RETRY_INITIAL_SECONDS": "1",
+                "CODEX_SLACK_STARTUP_RETRY_MAX_SECONDS": "4",
+            },
+            clear=False,
+        ):
+            server.run_socket_mode_forever(
+                app_factory=app_factory,
+                handler_factory=FakeHandler,
+                sleep_fn=sleeps.append,
+            )
+
+        self.assertEqual(sleeps, [1.0])
+        self.assertIn(("handler", "app-ok", "xapp-test"), events)
+        self.assertIn("start", events)
 
 
 class SlackAccessTests(unittest.TestCase):
@@ -236,6 +327,17 @@ class SessionStoreTests(unittest.TestCase):
         self.assertEqual(reloaded.get_reasoning_effort("C1:1"), "high")
         self.assertEqual(reloaded.get_session_origin("C1:1"), server.SESSION_ORIGIN_ATTACHED)
         self.assertEqual(reloaded.get_session_cwd("C1:1"), "/tmp/project-a")
+
+    def test_set_and_reload_preserves_collaboration_mode_without_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sessions.json"
+            store = server.SlackThreadSessionStore(path)
+            store.set_collaboration_mode("C1:1", server.COLLABORATION_MODE_PLAN, owner_user_id="U111")
+
+            reloaded = server.SlackThreadSessionStore(path)
+
+        self.assertEqual(reloaded.get_collaboration_mode("C1:1"), server.COLLABORATION_MODE_PLAN)
+        self.assertEqual(reloaded.get_owner("C1:1"), "U111")
 
     def test_attach_session_defaults_to_observe_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -825,10 +927,12 @@ class ProgressExtractionTests(unittest.TestCase):
                 input_items=None,
                 thread_config=None,
                 turn_overrides=None,
+                collaboration_mode=None,
                 heartbeat_seconds=None,
                 on_turn_started=None,
                 on_step=None,
                 on_heartbeat=None,
+                on_user_input_request=None,
             ):
                 on_turn_started(discovered_session_id, "turn-1")
                 on_step(ns(text='/bin/zsh -lc "pwd"', step_type="exec", item_type="commandExecution", data={}, turn_id="turn-1", item_id="c1"))
@@ -899,10 +1003,12 @@ class ProgressExtractionTests(unittest.TestCase):
                 input_items=None,
                 thread_config=None,
                 turn_overrides=None,
+                collaboration_mode=None,
                 heartbeat_seconds=None,
                 on_turn_started=None,
                 on_step=None,
                 on_heartbeat=None,
+                on_user_input_request=None,
             ):
                 on_turn_started(discovered_session_id, "turn-1")
                 on_step(
@@ -945,6 +1051,127 @@ class ProgressExtractionTests(unittest.TestCase):
         )
         self.assertTrue(fake_reporter.flushed)
         self.assertTrue(fake_reporter.closed)
+
+    def test_run_runtime_turn_with_updates_passes_collaboration_mode_to_runtime(self):
+        discovered_session_id = "019d5868-71ba-7101-9143-81867f3db5bf"
+        captured = {}
+
+        class FakeRuntime:
+            def run_turn(
+                self,
+                *,
+                session_id=None,
+                input_items=None,
+                thread_config=None,
+                turn_overrides=None,
+                collaboration_mode=None,
+                heartbeat_seconds=None,
+                on_turn_started=None,
+                on_step=None,
+                on_heartbeat=None,
+                on_user_input_request=None,
+            ):
+                captured["collaboration_mode"] = collaboration_mode
+                captured["has_user_input_handler"] = callable(on_user_input_request)
+                on_turn_started(discovered_session_id, "turn-1")
+                return ns(session_id=discovered_session_id, final_text="done", steps=[])
+
+        with patch.object(server, "get_app_runtime", return_value=FakeRuntime()):
+            result = server.run_runtime_turn_with_updates(
+                DummyClient(),
+                "C1",
+                "1",
+                "C1:1",
+                "continue",
+                session_id=None,
+                collaboration_mode=server.COLLABORATION_MODE_PLAN,
+                reasoning_effort="high",
+            )
+
+        self.assertEqual(result.session_id, discovered_session_id)
+        self.assertEqual(
+            captured["collaboration_mode"],
+            {
+                "mode": "plan",
+                "settings": {
+                    "model": server.get_codex_settings()[1],
+                    "reasoningEffort": "high",
+                    "developerInstructions": None,
+                },
+            },
+        )
+        self.assertTrue(captured["has_user_input_handler"])
+
+
+class RequestUserInputHelperTests(unittest.TestCase):
+    def test_extract_request_user_input_submission_supports_other_option(self):
+        pending_request = server.PendingSlackUserInputRequest(
+            token="tok-1",
+            thread_key="C1:1",
+            channel="C1",
+            thread_ts="1",
+            owner_user_id="U111",
+            session_id="sess-1",
+            request=server.RuntimeUserInputRequest(
+                request_id="req-1",
+                thread_id="sess-1",
+                turn_id="turn-1",
+                item_id="item-1",
+                questions=[
+                    server.RuntimeUserInputQuestion(
+                        id="choose",
+                        header="Choose",
+                        question="Pick one",
+                        is_other=True,
+                        options=[
+                            RuntimeUserInputQuestionOption(
+                                label="Yes (Recommended)",
+                                description="Continue",
+                            ),
+                            RuntimeUserInputQuestionOption(
+                                label="No",
+                                description="Stop",
+                            ),
+                        ],
+                    )
+                ],
+            ),
+            future=concurrent.futures.Future(),
+        )
+        view_state = {
+            "values": {
+                server.get_request_user_input_choice_block_id(0): {
+                    "choice": {
+                        "selected_option": {
+                            "value": server.REQUEST_USER_INPUT_OTHER_VALUE,
+                        }
+                    }
+                },
+                server.get_request_user_input_other_block_id(0): {
+                    "other_text": {
+                        "value": "Something else",
+                    }
+                },
+            }
+        }
+
+        payload, errors = server.extract_request_user_input_submission(view_state, pending_request)
+
+        self.assertEqual(errors, {})
+        self.assertEqual(payload, {"answers": {"choose": {"answers": ["Something else"]}}})
+
+    def test_build_thread_collaboration_mode_message_marks_active_button(self):
+        text, blocks = server.build_thread_collaboration_mode_message(
+            "C1:1",
+            session_id="sess-1",
+            collaboration_mode=server.COLLABORATION_MODE_PLAN,
+        )
+
+        self.assertIn("Current: `Plan`", blocks[0]["text"]["text"])
+        plan_button, default_button = blocks[1]["elements"]
+        self.assertNotEqual(plan_button["action_id"], default_button["action_id"])
+        self.assertEqual(plan_button.get("style"), "primary")
+        self.assertNotIn("style", default_button)
 
 
 class ProcessPromptTests(unittest.TestCase):
@@ -1416,6 +1643,7 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertIn("- thread_key: `C1:1`", text)
         self.assertIn(f"- session_id: `{self.session_id}`", text)
         self.assertIn("- watch_active: `yes`", text)
+        self.assertEqual(len(self.client.messages), 1)
 
     def test_status_reports_reasoning_effort_state(self):
         self.store.set_reasoning_effort(self.thread_key, "high", owner_user_id=self.user_id)
@@ -1434,6 +1662,40 @@ class ProcessPromptTests(unittest.TestCase):
         self.assertIn("- session_cwd: `/tmp/project-c`", text)
         self.assertIn("- thread_reasoning_effort: `high`", text)
         self.assertIn("- effective_reasoning_effort: `high (thread)`", text)
+        self.assertEqual(len(self.client.messages), 1)
+
+    def test_mode_command_posts_collaboration_mode_card(self):
+        self.store.set(self.thread_key, self.session_id, owner_user_id=self.user_id)
+
+        server.process_prompt(self.client, self.channel, self.thread_ts, "mode", self.user_id)
+
+        self.assertEqual(len(self.client.messages), 1)
+        self.assertEqual(self.client.messages[0]["blocks"][0]["text"]["text"].splitlines()[0], "*Collaboration Mode*")
+
+    def test_proposed_plan_response_posts_mode_card_after_result(self):
+        result = server.CodexRunResult(
+            session_id=self.session_id,
+            text="<proposed_plan>\nhello\n</proposed_plan>",
+            exit_code=0,
+            raw_output="",
+            final_output="<proposed_plan>\nhello\n</proposed_plan>",
+            json_output="",
+            cleaned_output="<proposed_plan>\nhello\n</proposed_plan>",
+            timed_out=False,
+        )
+
+        with patch.object(server, "run_runtime_turn_with_updates", return_value=result):
+            server.process_prompt(
+                self.client,
+                self.channel,
+                self.thread_ts,
+                "start a brand new task",
+                self.user_id,
+            )
+
+        self.assertEqual(len(self.client.messages), 3)
+        self.assertIn("<proposed_plan>", self.client.messages[1]["text"])
+        self.assertIn("*Collaboration Mode*", self.client.messages[2]["blocks"][0]["text"]["text"])
 
     def test_effort_command_sets_thread_override(self):
         self.store.set(
@@ -1665,6 +1927,34 @@ class ProcessPromptTests(unittest.TestCase):
 
         run_codex.assert_not_called()
         self.assertIn("处于 `observe` 模式", self.client.messages[0]["text"])
+
+    def test_runtime_timeout_is_reported_to_slack_and_resets_runtime(self):
+        self.store.set(
+            self.thread_key,
+            self.session_id,
+            owner_user_id=self.user_id,
+            session_origin=server.SESSION_ORIGIN_ATTACHED,
+            session_cwd="/tmp/original-project",
+        )
+        self.store.set_mode(self.thread_key, server.SESSION_MODE_CONTROL)
+        fake_runtime = ns(reset=MagicMock())
+
+        with patch.object(server, "get_app_runtime", return_value=fake_runtime) as get_app_runtime:
+            with patch.object(server, "read_thread_cwd", return_value="/tmp/original-project"):
+                with patch.object(
+                    server,
+                    "run_runtime_turn_with_updates",
+                    side_effect=CodexTimeoutError(
+                        "request timed out for method='thread/resume' after 90.0s"
+                    ),
+                ):
+                    server.process_prompt(self.client, self.channel, self.thread_ts, "continue", self.user_id)
+
+        get_app_runtime.assert_called_once()
+        fake_runtime.reset.assert_called_once()
+        self.assertIn("服务仍在运行", self.client.messages[-1]["text"])
+        self.assertIn("CodexTimeoutError", self.client.messages[-1]["text"])
+        self.assertIn("thread/resume", self.client.messages[-1]["text"])
 
 
 if __name__ == "__main__":
