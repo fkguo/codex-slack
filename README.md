@@ -299,7 +299,8 @@ watch
 - 这些 progress 默认开启；如果你只想看最终结果，可以在当前 Slack thread 里发送 `progress off`
 - 之后如果想恢复默认行为，发送 `progress on`；如果想回退到 `.env` 里的默认值，发送 `progress reset`
 - 为了和普通说明消息区分，镜像对话会用 `*User*` / `*Codex*` 标题加引用块样式发送到 Slack
-- 如果 `server.py` 重启了，session 绑定仍然保留，但正在运行的 `watch` 不会自动恢复；需要你在同一个 Slack thread 里重新发一次 `watch`
+- 如果 `server.py` 重启了，session 绑定仍然保留
+- 如果当前 Slack thread 处于 `observe` / `watch` 语义，服务恢复后会继续把同一个 session 的后续可显示消息镜像回这个 Slack thread
 - 如果 `watch` 因为读取失败而停止，直接重新发送一次 `watch` 即可重建镜像
 - 如果你不想再持续推送，发 `unwatch` 或 `stop watch`
 - 如果你想改为由 Slack 接管，再发 `control` 或 `takeover`；这时当前 thread 上已有的 `watch` 会自动停止
@@ -323,7 +324,7 @@ watch
 - `interrupt` 在 `observe` 和 `control` 模式下都可以使用，但前提是当前活跃 turn 已经是由 Slack 这边接管后启动的
 - `steer <text>` 会向当前活跃 turn 追加一条指令
 - `steer` 只在 `control` 模式下可用，避免你在只读镜像模式里意外写入
-- 如果 `server.py` 在某个活跃 turn 运行期间重启，那么该 turn 的 session 绑定仍保留，但 runtime 持有状态不会自动恢复；这时你仍可 `watch`，但对这一个已经在运行的 turn 不能继续 `interrupt` 或 `steer`
+- 如果 `server.py` 在 `control` 模式下某个活跃 turn 运行期间被关闭，那么当前这个 Codex turn 会被切断；session 绑定仍保留，但这一个 turn 不能继续 `interrupt` 或 `steer`
 - 等那一轮结束后，在 Slack 里继续发送普通消息启动由 `codex-slack` 接管的新 turn，之后 `interrupt` / `steer` 会再次可用
 - 这两个命令都依赖当前 session 里确实存在活跃 turn；如果当前没有正在运行的 turn，Slack 会直接返回错误说明
 
@@ -356,7 +357,8 @@ watch
 - 不同 thread 之间不会共享上下文
 - 绑定关系会持久化到本地 `.codex-slack-sessions.json`
 - `server.py` 重启后，已有 thread 仍可继续找到对应 session
-- `watch` 的后台推送线程不持久化；如果服务重启，需要在原 Slack thread 里重新发送 `watch`
+- 如果当前 thread 处于 `observe` / `watch`，服务恢复后会继续把同一 session 的后续镜像消息发回原 Slack thread
+- 如果当前 thread 处于 `control`，关闭 `server.py` 会切断当时正在运行的 Codex turn；服务恢复后仍可在原 Slack thread 上继续使用同一个 session
 - 同一个 Slack thread 内部会串行处理，避免并发 `resume`
 - 如果多个 Slack thread 指向同一个 session，也会按 `session_id` 串行执行
 
