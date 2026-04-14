@@ -16,7 +16,13 @@ import traceback
 import urllib.error
 import uuid
 import warnings
+import logging
 from contextlib import contextmanager, suppress
+
+logging.getLogger("slack_sdk.socket_mode").setLevel(logging.CRITICAL)
+logging.getLogger("slack_sdk.socket_mode.client").setLevel(logging.CRITICAL)
+logging.getLogger("slack_sdk.socket_mode.websockets").setLevel(logging.CRITICAL)
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -48,6 +54,11 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover
+    msvcrt = None
 
 
 def load_env():
@@ -4330,10 +4341,10 @@ def handle_keep_planning_action(client, channel_id, thread_ts, thread_key, *, us
             thread_key,
             user_id=user_id,
         )
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         runtime_diagnostics = ""
         if should_reset_runtime_after_exception(exc):
-            with suppress(Exception):
+            with suppress(Exception, asyncio.CancelledError):
                 runtime = get_app_runtime()
                 runtime.reset()
                 runtime_diagnostics = runtime.last_client_diagnostics()
@@ -6092,10 +6103,10 @@ def process_prompt(client, channel, thread_ts, prompt, user_id, slack_event_payl
                     )
         finally:
             release_thread_lock(thread_key)
-    except Exception as exc:
+    except (Exception, asyncio.CancelledError) as exc:
         runtime_diagnostics = ""
         if should_reset_runtime_after_exception(exc):
-            with suppress(Exception):
+            with suppress(Exception, asyncio.CancelledError):
                 runtime = get_app_runtime()
                 runtime.reset()
                 runtime_diagnostics = runtime.last_client_diagnostics()
@@ -6923,10 +6934,10 @@ def build_app():
                 user_id=user_id,
                 execution_mode=execution_mode,
             )
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             runtime_diagnostics = ""
             if should_reset_runtime_after_exception(exc):
-                with suppress(Exception):
+                with suppress(Exception, asyncio.CancelledError):
                     runtime = get_app_runtime()
                     runtime.reset()
                     runtime_diagnostics = runtime.last_client_diagnostics()
