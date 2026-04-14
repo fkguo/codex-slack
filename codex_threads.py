@@ -1,4 +1,7 @@
 import asyncio
+import os
+import subprocess
+import threading
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
@@ -93,6 +96,10 @@ class LargePayloadStdioTransport(StdioTransport):
     async def connect(self) -> None:
         if self._proc is not None:
             return
+        kwargs = {}
+        if os.name == 'nt':
+            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            
         try:
             self._proc = await asyncio.wait_for(
                 asyncio.create_subprocess_exec(
@@ -103,6 +110,7 @@ class LargePayloadStdioTransport(StdioTransport):
                     cwd=self._cwd,
                     env=self._env,
                     limit=self._line_limit_bytes,
+                    **kwargs
                 ),
                 timeout=self._connect_timeout,
             )
@@ -139,7 +147,7 @@ class LargePayloadStdioTransport(StdioTransport):
         await super().close()
         if stderr_task is not None:
             stderr_task.cancel()
-            with suppress(Exception):
+            with suppress(Exception, asyncio.CancelledError):
                 await stderr_task
 
 
@@ -158,6 +166,31 @@ def read_root(obj):
     if isinstance(obj, dict):
         return obj.get("root", obj)
     return getattr(obj, "root", obj)
+
+
+def _run_coro_sync(coro_factory, *args, **kwargs):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        result = None
+        exception = None
+        def target():
+            nonlocal result, exception
+            try:
+                result = asyncio.run(coro_factory(*args, **kwargs))
+            except Exception as e:
+                exception = e
+        t = threading.Thread(target=target)
+        t.start()
+        t.join()
+        if exception:
+            raise exception
+        return result
+    else:
+        return asyncio.run(coro_factory(*args, **kwargs))
 
 
 def truncate_text(text, max_length=280):
@@ -228,12 +261,11 @@ def read_thread_response(config: CodexAppServerConfig, session_id, *, include_tu
     last_error = None
     for _attempt in range(config.max_retries):
         try:
-            return asyncio.run(
-                read_thread_response_async(
-                    config,
-                    session_id,
-                    include_turns=include_turns,
-                )
+            return _run_coro_sync(
+                read_thread_response_async,
+                config,
+                session_id,
+                include_turns=include_turns,
             )
         except Exception as exc:
             last_error = exc
@@ -280,16 +312,15 @@ def list_threads(
     last_error = None
     for _attempt in range(config.max_retries):
         try:
-            return asyncio.run(
-                list_threads_async(
-                    config,
-                    archived=archived,
-                    cursor=cursor,
-                    cwd=cwd,
-                    limit=limit,
-                    sort_key=sort_key,
-                    sort_direction=sort_direction,
-                )
+            return _run_coro_sync(
+                list_threads_async,
+                config,
+                archived=archived,
+                cursor=cursor,
+                cwd=cwd,
+                limit=limit,
+                sort_key=sort_key,
+                sort_direction=sort_direction,
             )
         except Exception as exc:
             last_error = exc
@@ -311,7 +342,7 @@ def set_thread_name(config: CodexAppServerConfig, session_id, name):
     last_error = None
     for _attempt in range(config.max_retries):
         try:
-            return asyncio.run(set_thread_name_async(config, session_id, name))
+            return _run_coro_sync(set_thread_name_async, config, session_id, name)
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"更新 thread 名称失败: {last_error}")
@@ -355,7 +386,7 @@ def interrupt_turn(config: CodexAppServerConfig, thread_id, turn_id):
     last_error = None
     for _attempt in range(config.max_retries):
         try:
-            return asyncio.run(interrupt_turn_async(config, thread_id, turn_id))
+            return _run_coro_sync(interrupt_turn_async, config, thread_id, turn_id)
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"中断 turn 失败: {last_error}")
@@ -380,9 +411,7 @@ def steer_turn(config: CodexAppServerConfig, thread_id, expected_turn_id, input_
     last_error = None
     for _attempt in range(config.max_retries):
         try:
-            return asyncio.run(
-                steer_turn_async(config, thread_id, expected_turn_id, input_items)
-            )
+            return _run_coro_sync(steer_turn_async, config, thread_id, expected_turn_id, input_items)
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"追加 steer 输入失败: {last_error}")

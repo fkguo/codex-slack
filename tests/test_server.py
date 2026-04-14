@@ -1823,7 +1823,7 @@ class ProcessPromptTests(unittest.TestCase):
         prompt = run_runtime_turn_with_updates.call_args.args[4]
         self.assertIn(server.DEFAULT_DOCUMENT_ONLY_PROMPT, prompt)
         self.assertIn("report.pdf", prompt)
-        self.assertIn("/tmp/report.pdf", prompt)
+        self.assertIn(str(Path("/tmp/report.pdf")), prompt)
         cleanup_downloaded_documents.assert_called_once_with([downloaded_document])
         cleanup_download_directory.assert_called_once()
 
@@ -1873,7 +1873,7 @@ class ProcessPromptTests(unittest.TestCase):
         prompt = run_runtime_turn_with_updates.call_args.args[4]
         self.assertTrue(prompt.startswith("请总结这份文档"))
         self.assertIn("notes.md", prompt)
-        self.assertIn("/tmp/notes.md", prompt)
+        self.assertIn(str(Path("/tmp/notes.md")), prompt)
 
     def test_document_download_failure_returns_user_facing_error(self):
         document_download = server.slack_document_inputs.SlackDocumentDownload(
